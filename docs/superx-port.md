@@ -1,5 +1,7 @@
 # SuperX CFW V1.1 port to XGB35
 
+**EN** · [RU](superx-port.ru.md)
+
 **Status:** offline compatibility review. V1.1 lists **Powkiddy X39, X39 Pro, X45, X51 and X70**. XGB35 boot and gameplay under SuperX remain unverified. [Upstream project](https://github.com/scooper540/powkiddy-X39-X45-X51-X70-cfw) · [V1.1 release](https://github.com/scooper540/powkiddy-X39-X45-X51-X70-cfw/releases/tag/V1.1)
 
 ## Required changes

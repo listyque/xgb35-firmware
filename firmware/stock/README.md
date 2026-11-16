@@ -1,5 +1,7 @@
 # Stock XGB35 firmware · August 22, 2023
 
+**EN** · [RU](README.ru.md)
+
 - **Download:** [`update.zip` on GitHub Releases](https://github.com/listyque/xgb35-firmware/releases/download/stock-2023-08-22/update.zip)
 - **Size:** 72,764,416 bytes
 - **SHA-256:** `957ab55ae5c8af8994f47b4b403d64808c59b2bb01cc9af7f443302c761516e2`

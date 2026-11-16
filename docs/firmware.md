@@ -1,5 +1,7 @@
 # Firmware and multiboot status
 
+**EN** · [RU](firmware.ru.md)
+
 | Project | Status |
 | --- | --- |
 | [Reconstructed stock firmware](../firmware/stock/README.md) | August 2023 PATO package verified offline. Installation with this package has not been tested on the console |

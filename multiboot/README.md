@@ -1,5 +1,7 @@
 # XGB35 Multiboot Installer Preview
 
+**EN** · [RU](README.ru.md)
+
 [Installer release](https://github.com/listyque/xgb35-firmware/releases/tag/multiboot-installer-v0.1.0)
 
 This Windows tool prepares a **dedicated microSD** for XGB35 using local build artifacts. It places the Actions BootROM payload before partition 1 and installs an Alpine filesystem and 480×320 stock userspace images on that partition. The local XGB35 boot build supplies the runtime and graphical menu.

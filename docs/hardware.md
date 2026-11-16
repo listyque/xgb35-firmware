@@ -1,5 +1,7 @@
 # XGB35 hardware
 
+**EN** · [RU](hardware.ru.md)
+
 These measurements describe one physical XGB35 unit. Retail listings and firmware profiles can differ across revisions.
 
 | Component | Specification | Evidence |
