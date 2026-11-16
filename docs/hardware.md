@@ -1,57 +1,57 @@
-# Железо XGB35
+# XGB35 hardware
 
-Данные относятся к одному разобранному XGB35. В таблице указано, откуда известна каждая характеристика.
+These measurements describe one physical XGB35 unit. Retail listings and firmware profiles can differ across revisions.
 
-| Узел | Характеристика | Основание |
+| Component | Specification | Evidence |
 | --- | --- | --- |
-| Модель | **XGB35**, экран класса 3,5″ | Каталожные фото и описание. [Wiisun XGB35](https://www.game-gaga.com/xgb35-handheld-game-console-support-for-music-videos-picture-text-reading-3-5-inch-ips-screen-linux-handheld-game-player-product/) |
-| Основная плата | **LLW7051-057-MAIN-BOARD V2.0**, дата **2022‑07‑19** | [Фото маркировки](../photos/board-detail.png) |
-| SoC | **Actions Semiconductor ATM7051H**, семейство Actions OWL/ATS3605; 32-битная ARMv7-A | USB BootROM ADFU и запуск Linux 3.10.52. В диагностическом запуске виден одноядерный профиль `maxcpus=1`, поэтому этот лог не устанавливает число физических ядер |
-| Оперативная память | **Не менее 128 МиБ** адресуемой DDR | RAM-тест проверил отсутствие алиасов на разнесённых адресах вплоть до физического `0x07fff000`; Linux работал с картой `0x00000000–0x07ffffff`. Верхнюю границу физической памяти не измеряли |
-| Внутреннее хранилище | **Micron MT29F64G08CBABA WP:B**, 64 Гбит = **8 ГиБ**; сырая MLC NAND | [Фото чипа](../photos/nand-detail.png), считанный ID `2c 64 44 4b a9`, [даташит Micron](https://datasheet.lcsc.com/lcsc/1908271118_Micron-Tech-MT29F64G08CBABAWP-B_C410865.pdf) |
-| LCD | Шлейф **XXL03518B**. Рабочий framebuffer **320×480 RGB565**; интерфейс на экране **480×320** с поворотом на 90° | Вывод терминала на приставке. Последовательность инициализации соответствует семейству **ST7796S**; отдельного подтверждения модели считыванием ID нет. [Даташит Sitronix](https://dl.espressif.com/dl/schematics/ST7796S_SPEC_V1.0.pdf) |
-| Подключение LCD | Параллельный RGB для пикселей, SPI для команд панели; GPIOB6 и PWM0 для питания панели и подсветки | Проверено на RAM-тестах. Наличие подсветки само по себе не подтверждает вывод кадра |
-| PMIC | **Actions ATC2603C**, адрес I²C `0x65` | Настройки DTB, рабочие операции PMIC и журнал Linux |
-| Аккумулятор | **XY 604050**, **3,7 В**, **2000 мА·ч**, **7,4 Вт·ч** по маркировке | [Фото платы и аккумулятора](../photos/board-back.png) |
-| USB | Разъём USB-C; BootROM **ADFU `10d6:10d6`**; диагностический Linux поднимал **ADB по WinUSB** и тестовый Mass Storage | USB-идентификация и обмен с устройством |
-| Карта памяти | microSD/TF | [Фото разъёма](../photos/sd-close.png). Образ автономного старта подготовлен; холодная загрузка с него здесь не подтверждена |
-| Управление | Крестовина, два стика, ABXY, плечевые и служебные кнопки | Каталожное фото; управление консолью и внешней клавиатурой реализовано в диагностическом терминале |
-| Звук и внешний экран | Встроенный динамик, 3,5-мм выход и цифровой видеовыход заявлены для XGB35 | Динамик виден в разобранном экземпляре. Работу внешнего видеовыхода в диагностической сборке не проверяли. [Описание Wiisun](https://www.game-gaga.com/xgb35-handheld-game-console-support-for-music-videos-picture-text-reading-3-5-inch-ips-screen-linux-handheld-game-player-product/) |
-| UART | В проверенном DTB задано `console=ttyS5,115200`; параметры терминала **115200 8N1** | Linux регистрирует UART5. Физическую распиновку и стабильный захват UART на этом экземпляре не подтвердили. [Фото области площадок](../photos/console-uart-pads.png) |
+| Console | **XGB35**, 3.5-inch display class | [Wiisun catalog](https://www.game-gaga.com/xgb35-handheld-game-console-support-for-music-videos-picture-text-reading-3-5-inch-ips-screen-linux-handheld-game-player-product/) |
+| Main board | **LLW7051-057-MAIN-BOARD V2.0**, dated **2022-07-19** | [Board marking](../photos/board-detail.png) |
+| SoC | **Actions Semiconductor ATM7051H**, Actions OWL / ATS3605, 32-bit ARMv7-A | BootROM ADFU and Linux 3.10.52. The diagnostic boot used `maxcpus=1`, so it established a single active CPU for that session |
+| RAM | **At least 128 MiB** of addressable DDR | A reversible alias test sampled distinct addresses up to physical `0x07fff000`. Linux ran with a `0x00000000–0x07ffffff` memory map. The upper physical limit remains unmeasured |
+| Internal storage | **Micron MT29F64G08CBABA WP:B**, **64 Gbit / 8 GiB**, raw MLC NAND | [Package photo](../photos/nand-detail.png), observed ID `2c 64 44 4b a9`, [Micron data sheet](https://datasheet.lcsc.com/lcsc/1908271118_Micron-Tech-MT29F64G08CBABAWP-B_C410865.pdf) |
+| LCD | **XXL03518B** flex marking. **320×480 RGB565** framebuffer, rotated 90° for a **480×320** landscape interface | On-device framebuffer terminal. The initialization sequence is consistent with the ST7796S family. An independent controller-ID read did not confirm the exact chip. [Sitronix data sheet](https://dl.espressif.com/dl/schematics/ST7796S_SPEC_V1.0.pdf) |
+| LCD interface | Parallel RGB pixels, SPI LCD commands, GPIOB6 and PWM0 for panel power and backlight | RAM-side register and display tests |
+| PMIC | **Actions ATC2603C**, I²C address `0x65` | Device tree, PMIC transactions and Linux log |
+| Battery | **XY 604050**, **3.7 V**, **2,000 mAh**, **7.4 Wh** | [Battery and PCB photo](../photos/board-back.png) |
+| USB | USB-C; BootROM ADFU `10d6:10d6`; diagnostic ADB over WinUSB and a RAM-backed Mass Storage test | USB enumeration and transfer tests |
+| Removable storage | microSD / TF | [Slot photo](../photos/sd-close.png). The autonomous microSD boot image passed offline checks. Cold boot still needs confirmation |
+| Controls | D-pad, dual sticks, ABXY, shoulder buttons and function buttons | Catalog photo and diagnostic terminal input code |
+| Audio and external display | Internal speaker, 3.5 mm jack and digital video output listed for XGB35 | Speaker seen on the unit. The diagnostic build did not verify external video. [Wiisun catalog](https://www.game-gaga.com/xgb35-handheld-game-console-support-for-music-videos-picture-text-reading-3-5-inch-ips-screen-linux-handheld-game-player-product/) |
+| UART | Linux device tree selects `ttyS5` at **115200 8N1** | Linux registered UART5. The pad pinout and reliable capture on this unit remain unverified. [Pad area photo](../photos/console-uart-pads.png) |
 
-## Экран и варианты прошивок
+## Display profiles
 
-Разрешение **320×480** употребляется для физической развёртки, а **480×320** для интерфейса при обычной горизонтальной ориентации корпуса. Значения **480×272** и **640×480** встречаются в торговых карточках XGB35. В старом U-Boot и MISC из изученного бэкапа NAND выбран профиль **1024×600**. Поэтому размер из карточки, DTB или ресурсов прошивки нужно проверять выводом изображения на конкретной панели. [Карточка LZAKMR](https://manuals.plus/ae/1005006855426011) · [Карточка FAITDER](https://manuals.plus/asin/B0DG8FCK92)
+The working interface presents a 480×320 landscape screen through a 320×480 portrait framebuffer. XGB35 listings also mention 480×272 and 640×480. The older NAND U-Boot and MISC package selects a 1024×600 profile. Confirm display geometry against the panel and runtime output before installing a flash image. [LZAKMR listing](https://manuals.plus/ae/1005006855426011) · [FAITDER listing](https://manuals.plus/asin/B0DG8FCK92)
 
-## NAND и логические разделы
+## NAND geometry and logical partitions
 
-Физическая страница содержит **8192 байта данных + 744 байта OOB**. В блоке стирания **256 страниц**; для идентификации блоков и восстановления нужны OOB, ECC и правило отображения FTL. Логическая копия раздела Linux содержит данные после трансляции. Для штатного пакета обновления используются логические образы и штатный контейнер Actions PATO. [Геометрия и статус NAND в документации Micron](https://datasheet.lcsc.com/lcsc/1908271118_Micron-Tech-MT29F64G08CBABAWP-B_C410865.pdf)
+A physical page contains **8,192 data bytes + 744 OOB bytes**. An erase block contains **256 pages**. Raw NAND recovery uses OOB markers and ECC. Logical Linux partition images are read through the FTL. The stock OTA container carries logical partition images and a dedicated bootloader record. [Micron NAND geometry](https://datasheet.lcsc.com/lcsc/1908271118_Micron-Tech-MT29F64G08CBABAWP-B_C410865.pdf)
 
-| Устройство | Раздел | Размер логического бэкапа или наблюдение |
+| Device | Partition | Observed role |
 | --- | --- | --- |
-| `/dev/nand0p1` | MISC | 8 МиБ, FAT; ядро, DTB, ramdisk и параметры загрузки |
-| `/dev/nand0p2` | RECOVERY | 10 МиБ, FAT; отдельный recovery initramfs и штатный обновлятор |
-| `/dev/nand0p3` | CONFIG | 128 КиБ; содержит параметры устройства |
-| `/dev/nand0p4` | SYSTEM | 40 МиБ; SquashFS с ОС и штатным `manager` |
-| `/dev/nand0p5` | UPGRADE | 5 МиБ, FAT; раздел обновления |
-| `/dev/nand0p6` | RES | 40 МиБ; SquashFS с ресурсами интерфейса |
-| `/dev/nand0p8` | UDISK | FAT32, метка **GAME**, около 4,82 ГиБ; пользовательский том |
+| `/dev/nand0p1` | MISC | 8 MiB FAT volume with kernel, DTB, ramdisk and boot parameters |
+| `/dev/nand0p2` | RECOVERY | 10 MiB FAT volume with recovery initramfs and stock updater |
+| `/dev/nand0p3` | CONFIG | 128 KiB of device configuration |
+| `/dev/nand0p4` | SYSTEM | 40 MiB partition with the stock SquashFS and `manager` |
+| `/dev/nand0p5` | UPGRADE | 5 MiB FAT update partition |
+| `/dev/nand0p6` | RES | 40 MiB partition with SquashFS interface resources |
+| `/dev/nand0p8` | UDISK | About 4.82 GiB, FAT32, label **GAME** |
 
-Статус Micron `0xE0` в живом тесте показал, что аппаратная защита массива от записи выключена. USB Mass Storage проверялся с тестовым томом из RAM. Экспорт фактического `GAME` только для чтения требует проверки поведения NAND-драйвера при инициализации.
+A live NAND status read returned `0xE0`, which indicates that hardware write protection was inactive. The Mass Storage experiment exported a RAM-backed test volume. Exporting **GAME** read-only still requires checking the NAND driver's initialization behavior.
 
-## Загрузка и диагностика
+## Boot and diagnostics
 
-Штатный путь проходит через BootROM, ранний загрузчик NAND, U-Boot и Linux. В режиме ADFU на этой плате запускали код из SRAM, поднимали DDR и запускали диагностический Linux из RAM. Дальнейший обмен выполнялся через ADB по WinUSB. Для следующего прогона подготовили возврат из работающего Linux в ADFU командой `reboot-adfu`.
+The stock boot path runs BootROM, the early NAND loader, U-Boot and Linux. ADFU allowed a diagnostic SRAM program to initialize DDR and boot Linux from RAM. Once ADB over WinUSB was available, commands and files could be transferred without UART. An XGB35 RAM utility named `reboot-adfu` was prepared for returning to ADFU from a running Linux session.
 
-## Фотографии экземпляра
+## Photos of the tested unit
 
-![Плата XGB35 V2.0 крупным планом](../photos/board-detail.png)
+![XGB35 V2.0 main board marking](../photos/board-detail.png)
 
-| Фото | Что видно |
+| Photo | Detail |
 | --- | --- |
-| [Плата со стороны аккумулятора](../photos/board-back.png) | Аккумулятор, кнопочные контакты, LCD-разъём и подписанные точки питания |
-| [Ревизия платы крупным планом](../photos/board-detail.png) | Маркировка V2.0 и дата |
-| [NAND Micron](../photos/nand-detail.png) | Маркировка чипа NAND |
-| [Область отладки ADFU](../photos/adfu-close.png) | Крупный план области платы, использованной при диагностике |
-| [Разъём microSD](../photos/sd-close.png) | Разъём и ближайшие площадки |
-| [Область UART](../photos/console-uart-pads.png) | Фото для сверки расположения площадок |
+| [Battery side of the board](../photos/board-back.png) | Battery, button contacts, LCD connector and labeled rails |
+| [Board revision](../photos/board-detail.png) | V2.0 marking and date |
+| [Micron NAND](../photos/nand-detail.png) | NAND package marking |
+| [ADFU inspection area](../photos/adfu-close.png) | Area used during low-level diagnostics |
+| [microSD slot](../photos/sd-close.png) | Slot and adjacent pads |
+| [UART pad area](../photos/console-uart-pads.png) | Close-up for comparison against the physical board |

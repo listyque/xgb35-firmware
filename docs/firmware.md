@@ -1,14 +1,10 @@
-# CFW и мультибут
+# Firmware and multiboot status
 
-| Направление | Состояние |
+| Project | Status |
 | --- | --- |
-| [Штатная прошивка из бэкапа NAND](../firmware/stock/README.md) | Пакет PATO собран и проверен на ПК; установка этим пакетом на консоли не проверена |
-| Собственная CFW XGB35 | Диагностический Linux, ADB/WinUSB и framebuffer-терминал работали из RAM. Подготовлены меню, сборка Alpine и образы для дальнейшей интеграции |
-| Мультибут с microSD | Подготовлены загрузочный образ и переключение между Alpine, штатной оболочкой и терминалом. Здесь ещё нет опубликованного образа с подтверждённым холодным стартом на XGB35 |
-| **SuperX CFW для Powkiddy** | Сторонний проект, релиз **V1.1**. Поддержка XGB35 требует порта и проверки |
+| [Reconstructed stock firmware](../firmware/stock/README.md) | August 2023 PATO package verified offline. Installation with this package has not been tested on the console |
+| XGB35 CFW | Linux booted from RAM, with WinUSB ADB and a framebuffer terminal. The standalone CFW build is still in development |
+| [XGB35 Multiboot installer preview](../multiboot/README.md) | Provisions microSD from local boot, Alpine and stock assets. The boot payload contains the in-development XGB35 CFW and is supplied by the operator. Cold boot from the card remains unverified |
+| [SuperX CFW for Powkiddy](superx-port.md) | Upstream V1.1 supports X39, X39 Pro, X45, X51 and X70. The XGB35 port plan is based on the upstream release and local artifacts |
 
-## SuperX CFW
-
-Автор проекта — **scooper540**. В релизе **SuperX V1.1** перечислены **Powkiddy X39, X39 Pro, X45, X51 и X70** на Actions ATM7051. Общий SoC даёт отправную точку для переноса. На XGB35 предстоит проверить профиль LCD, поворот framebuffer, события кнопок, звук, работу с microSD и способ запуска без изменения NAND. Пакет обновления для Powkiddy следует применять только к указанным разработчиком моделям. [Исходный проект](https://github.com/scooper540/powkiddy-X39-X45-X51-X70-cfw) · [Релиз SuperX V1.1](https://github.com/scooper540/powkiddy-X39-X45-X51-X70-cfw/releases/tag/V1.1)
-
-При публикации сборок здесь будут указаны модель и ревизия платы, способ запуска (RAM, microSD или OTA), SHA-256 и результаты испытаний. CFW XGB35, мультибут и порт SuperX следует выпускать отдельными сборками.
+Future releases should identify the board revision, boot medium, exact asset hash and the hardware tests that passed.

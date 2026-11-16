@@ -1,22 +1,20 @@
-# Штатная прошивка XGB35 · 22 августа 2023
+# Stock XGB35 firmware · August 22, 2023
 
-**Файл:** [`update.zip` в релизе GitHub](https://github.com/listyque/xgb35-firmware/releases/download/stock-2023-08-22/update.zip)  
-**Размер:** 72 764 416 байт  
-**SHA-256:** `957ab55ae5c8af8994f47b4b403d64808c59b2bb01cc9af7f443302c761516e2`
+- **Download:** [`update.zip` on GitHub Releases](https://github.com/listyque/xgb35-firmware/releases/download/stock-2023-08-22/update.zip)
+- **Size:** 72,764,416 bytes
+- **SHA-256:** `957ab55ae5c8af8994f47b4b403d64808c59b2bb01cc9af7f443302c761516e2`
 
-Пакет восстановлен из старых компонентов прошивки, считанных с NAND этой приставки. Формат — **Actions PATO OTA**, штатное имя файла — `update.zip`. Номер контейнера `2.0.00.230822.0628` составлен по дате и времени заводской сборки. Исходный заголовок OTA 2023 года не найден. Версия `2.0.00.240519.1736`, после которой приставка перестала загружаться, в этот репозиторий не включена.
+This **Actions PATO OTA** file was reconstructed from older firmware components read from the tested XGB35 NAND. The container version `2.0.00.230822.0628` was derived from the original build date and time. The original 2023 OTA header was unavailable. The included payloads all come from the older NAND backup.
 
-| Запись PATO | Назначение |
+| PATO entry | Content |
 | --- | --- |
-| U-Boot | Старый загрузчик, извлечённый с NAND. Контейнер направляет его в загрузочную область NAND |
-| MISC | Старые ядро, DTB, ramdisk и параметры загрузки |
-| RECOVERY | Старое recovery и штатный обработчик обновлений |
-| SYSTEM | Старый SquashFS со штатной ОС, программами и `manager` |
-| RES | Старый SquashFS с ресурсами интерфейса |
+| U-Boot | Older bootloader extracted from NAND. The updater targets the boot area |
+| MISC | Older kernel, device tree, ramdisk and boot settings |
+| RECOVERY | Older recovery filesystem and stock updater |
+| SYSTEM | Older SquashFS operating system and stock `manager` |
+| RES | Older SquashFS interface resources |
 
-На ПК проверены магия PATO, границы всех записей, контрольная сумма заголовка и каждой записи, CRC заголовка и данных U-Boot и файловые системы в образах. **Прошивка восстановленного контейнера на приставке не проверялась.** Пакет содержит U-Boot, поэтому штатное обновление им затрагивает загрузочную область. Старый MISC задаёт режим **1024×600**. Совместимость этого режима с испытанной панелью XGB35, которая работала как 320×480 с программным поворотом, требует отдельной проверки. CONFIG, UPGRADE и пользовательский GAME в пакет не включены.
-
-Проверка скачанного файла в PowerShell:
+Offline checks covered the PATO signature, entry bounds, header and payload checksums, both U-Boot CRCs and the filesystems. **The reconstructed OTA has not been installed on the console.** The package updates the boot area and the older MISC selects a **1024×600** profile. Compatibility with the tested 320×480 panel still needs verification. CONFIG, UPGRADE and the user GAME partition are outside this package.
 
 ```powershell
 Get-FileHash -Algorithm SHA256 -LiteralPath .\update.zip
