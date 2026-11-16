@@ -1,5 +1,7 @@
 # XGB35 (ATM7051H) · Stock Firmware, CFW and Multiboot
 
+**English** · [Русский](README.ru.md)
+
 ![XGB35 handheld game console with a 3.5-inch display](https://imgaz3.staticbg.com/thumb/large/oaupload/banggood/images/7E/63/02f22f34-783a-42d9-942a-22dad2963375.jpg)
 
 XGB35 catalog photo from Banggood. [Product listing and photo credit](https://www.lowcychin.pl/retrokonsola-xgb35/)
