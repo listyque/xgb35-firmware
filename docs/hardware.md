@@ -9,7 +9,7 @@ These measurements describe one physical XGB35 unit. Retail listings and firmwar
 | Console | **XGB35**, 3.5-inch display class | [Wiisun catalog](https://www.game-gaga.com/xgb35-handheld-game-console-support-for-music-videos-picture-text-reading-3-5-inch-ips-screen-linux-handheld-game-player-product/) |
 | Main board | **LLW7051-057-MAIN-BOARD V2.0**, dated **2022-07-19** | [Board marking](../photos/board-detail.png) |
 | SoC | **Actions Semiconductor ATM7051H**, Actions OWL / ATS3605, 32-bit ARMv7-A | BootROM ADFU and Linux 3.10.52. The diagnostic boot used `maxcpus=1`, so it established a single active CPU for that session |
-| RAM | **At least 128 MiB** of addressable DDR | A reversible alias test sampled distinct addresses up to physical `0x07fff000`. Linux ran with a `0x00000000–0x07ffffff` memory map. The upper physical limit remains unmeasured |
+| RAM | **256 MiB DDR3**, SK hynix **H5TQ2G63DFR-H9C**, x16 bus | [Package marking](../photos/ddr-marking.png) · [SK hynix data sheet](https://www.unikeyic.com/media/datasheet/8b/06/108a/8b/01b4e312316605b5dbbeedfd3ef68ae2.pdf) |
 | Internal storage | **Micron MT29F64G08CBABA WP:B**, **64 Gbit / 8 GiB**, raw MLC NAND | [Package photo](../photos/nand-detail.png), observed ID `2c 64 44 4b a9`, [Micron data sheet](https://datasheet.lcsc.com/lcsc/1908271118_Micron-Tech-MT29F64G08CBABAWP-B_C410865.pdf) |
 | LCD | **XXL03518B** flex marking. **320×480 RGB565** framebuffer, rotated 90° for a **480×320** landscape interface | On-device framebuffer terminal. The initialization sequence is consistent with the ST7796S family. An independent controller-ID read did not confirm the exact chip. [Sitronix data sheet](https://dl.espressif.com/dl/schematics/ST7796S_SPEC_V1.0.pdf) |
 | LCD interface | Parallel RGB pixels, SPI LCD commands, GPIOB6 and PWM0 for panel power and backlight | RAM-side register and display tests |
@@ -20,6 +20,12 @@ These measurements describe one physical XGB35 unit. Retail listings and firmwar
 | Controls | D-pad, dual sticks, ABXY, shoulder buttons and function buttons | Catalog photo and diagnostic terminal input code |
 | Audio and external display | Internal speaker, 3.5 mm jack and digital video output listed for XGB35 | Speaker seen on the unit. The diagnostic build did not verify external video. [Wiisun catalog](https://www.game-gaga.com/xgb35-handheld-game-console-support-for-music-videos-picture-text-reading-3-5-inch-ips-screen-linux-handheld-game-player-product/) |
 | UART | Linux device tree selects `ttyS5` at **115200 8N1** | Linux registered UART5. The pad pinout and reliable capture on this unit remain unverified. [Pad area photo](../photos/console-uart-pads.png) |
+
+## RAM
+
+The tested **LLW7051-057-MAIN-BOARD V2.0** board dated **2022-07-19** carries an **H5TQ2G63DFR-H9C** chip rated at 2 Gbit (128M × 16), equal to **256 MiB**. The earlier 128 MiB figure describes the memory map of the diagnostic Linux build. Its address alias test sampled physical addresses up to `0x07fff000`.
+
+![SK hynix H5TQ2G63DFR-H9C marking on the XGB35 V2.0 board](../photos/ddr-marking.png)
 
 ## Display profiles
 
