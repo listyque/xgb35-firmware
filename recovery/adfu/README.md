@@ -2,6 +2,8 @@
 
 [Русская инструкция](README.ru.md)
 
+[Download the Windows x64 recovery kit](https://github.com/listyque/xgb35-firmware/releases/tag/adfu-recovery-v0.1.0) with the driver, image, portable Python and `START.cmd`. The illustrated beginner guide is `START-HERE.ru.html`.
+
 This kit targets the XGB35 with **LLW7051-057-MAIN-BOARD V2.0 (2022-07-19)** and Micron **MT29F64G08CBABA WP:B**, ID `2c 64 44 4b a9`. A physical page contains 8192 data bytes and 744 OOB bytes. Match the photos and NAND before using a board-specific image. [Board details](../../docs/hardware.md) · [ADFU pads](../../photos/adfu-close.png)
 
 1. Remove the microSD with the console powered off. Connect the data USB port to Windows. Try Reset first. On the tested unit, a failure to find a bootable NAND sector could enter BootROM ADFU automatically. If needed, bridge the two verified ADFU pads shown in the photo during Reset and remove the bridge after USB enumeration. The device is `USB\VID_10D6&PID_10D6`. ADB in a running Linux session has a different USB ID.

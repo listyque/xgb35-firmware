@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Восстановление XGB35 через ADFU</title>
+<style>
+body{font:17px/1.55 "Segoe UI",sans-serif;color:#172336;background:#f4f7fa;margin:0}
+main{max-width:760px;margin:auto;padding:28px 18px 48px} h1{line-height:1.15}
+section{background:white;border:1px solid #dbe3eb;border-radius:12px;padding:16px 20px;margin:14px 0}
+h2{font-size:1.2rem;margin:0 0 10px} p{margin:8px 0} img{max-width:100%;border-radius:6px}
+.warning{border-left:5px solid #ad500d} code{font-size:.95em;background:#e9eff5;padding:2px 5px} a{color:#124c91}
+</style>
+</head>
+<body><main>
+<h1>Вернуть XGB35 к жизни</h1>
+<p>Этот комплект для Windows 10/11 x64 восстанавливает загрузочный блок приставки через USB. ADFU — режим восстановления, который может работать даже с чёрным экраном.</p>
+<section class="warning"><h2>Сначала сверь приставку</h2>
+<p>На плате должно быть написано <strong>LLW7051-057-MAIN-BOARD V2.0</strong>, рядом дата <strong>2022-07-19</strong>. На микросхеме NAND — <strong>Micron 29F64G08CBABA WP:B</strong>. Если надписи отличаются или их не видно, остановись до записи.</p>
+<p><a href="photos/board-detail.png">Фото платы крупно</a> · <a href="photos/nand-detail.png">Фото микросхемы памяти</a></p></section>
+<section><h2>1. Распакуй и открой комплект</h2>
+<p>Щёлкни по скачанному ZIP правой кнопкой, выбери <strong>Извлечь всё</strong> и открой получившуюся папку. Установки Python не требуется, он уже внутри.</p>
+<p>Щёлкни по <code>START.cmd</code> правой кнопкой, выбери <strong>Запуск от имени администратора</strong> и подтверди запрос Windows. В меню введи <strong>1</strong> и нажми Enter для установки драйвера.</p></section>
+<section><h2>2. Подключи приставку</h2>
+<p>Выключи её, вынь карту microSD, подключи USB-кабель с передачей данных. Один раз нажми <strong>Reset</strong>. В меню введи <strong>2</strong>. Сообщение «Windows видит ADFU» означает, что можно идти дальше, даже если экран чёрный.</p>
+<p>Если ADFU не появился, сверь кабель и USB-порт. На указанной ревизии есть два маленьких круглых контакта прямо у надписи <strong>ADFU</strong> слева от NAND. Если уверенно нашёл оба, соедини их на время Reset и убери перемычку, когда Windows обнаружит устройство. Снова введи <strong>2</strong>.</p>
+<img src="photos/adfu-close.png" alt="Два небольших круглых контакта справа от надписи ADFU и слева от микросхемы NAND">
+</section>
+<section><h2>3. Сохрани копию и запиши образ</h2>
+<p>Введи <strong>3</strong>. Меню попросит подтвердить маркировку. Программа сначала сохранит в папке <code>backups</code> копию двух загрузочных блоков, затем проверит связь и снимет ещё одну копию блока 0. На это может уйти несколько минут.</p>
+<p>Когда программа попросит ввести <strong>ВОССТАНОВИТЬ</strong>, это последнее подтверждение. После него она сотрёт и перезапишет физический блок 0, затем проверит результат. Во время записи не нажимай Reset и не отключай USB или питание. Нажми Reset, когда появится сообщение «Проверка завершилась».</p>
+</section>
+<section><h2>Если что-то пошло не так</h2>
+<p>Если программа остановилась с ошибкой, сфотографируй окно. Сохрани папку <code>backups</code> и журнал из <code>tools\nand-write-preparation</code>. Если ошибка возникла после подтверждения записи, часть блока могла уже измениться. Для этого случая в технической инструкции описаны проверка текущего блока и возобновление.</p>
+<p>Копия инструкции лежит в <code>tools\TECHNICAL.ru.md</code>. Её можно открыть в Блокноте. <a href="https://github.com/listyque/xgb35-firmware/blob/main/recovery/adfu/README.ru.md">Техническая инструкция на GitHub</a></p></section>
+</main></body></html>
