@@ -1,0 +1,493 @@
+/**
+ * TS mirror of the native player presentation contract.
+ * Swift side: modules/mpv-player/ios/NativePlayer/PlayerConfig.swift +
+ * NativePlayerModule.swift. All positions/durations cross the bridge in
+ * seconds (or ms where named) — JS converts Jellyfin ticks before handing
+ * anything down; native never sees ticks.
+ */
+
+export type NativePlayerPlayMethod =
+  | "DirectPlay"
+  | "DirectStream"
+  | "Transcode";
+
+export type NativePlayerStreamConfig = {
+  url: string;
+  headers?: Record<string, string>;
+  externalSubtitles?: string[];
+  startPositionSec?: number;
+  autoplay?: boolean;
+  /** MPV track ids pre-resolved by JS (1-based; -1 disables subtitles). */
+  initialSubtitleMpvId?: number;
+  initialAudioMpvId?: number;
+  playMethod?: NativePlayerPlayMethod;
+  transcodeReasons?: string[];
+  cacheConfig?: {
+    enabled?: "auto" | "yes" | "no";
+    cacheSeconds?: number;
+    maxBytes?: number;
+    maxBackBytes?: number;
+  };
+  /** Source video dimensions (for zoom-to-fill subtitle compensation). */
+  videoWidth?: number;
+  videoHeight?: number;
+  /**
+   * Content frame rate in fps (MediaStreams.RealFrameRate), sent only when
+   * the user's match-refresh-rate setting is on — the native side never reads
+   * settings. Android picks a display mode with this rate: direct-played MKV
+   * gives the platform no frame rate, so 25fps content otherwise stays on a
+   * 60Hz panel and judders. Ignored by iOS.
+   */
+  contentFrameRate?: number;
+};
+
+export type NativePlayerMetadata = {
+  /** Jellyfin item id — identifies whether a load() swap changed the item. */
+  itemId?: string;
+  title?: string;
+  /** Second header line, e.g. "Series Name · S2E5". */
+  subtitle?: string;
+  artworkUri?: string;
+  /** Custom proxy auth headers for `artworkUri`, when it needs them. */
+  artworkHeaders?: Record<string, string>;
+  isEpisode?: boolean;
+};
+
+export type NativePlayerChapter = {
+  name?: string;
+  startSec: number;
+};
+
+export type NativePlayerSegmentType =
+  | "Intro"
+  | "Outro"
+  | "Recap"
+  | "Commercial"
+  | "Preview";
+
+/**
+ * What the player does with a segment. Resolved on the JS side from the
+ * per-type skip settings so the native player never has to read settings, and
+ * so both stay in step with the JS players.
+ */
+export type NativePlayerSegmentSkipMode = "none" | "ask" | "auto";
+
+export type NativePlayerSegment = {
+  type: NativePlayerSegmentType;
+  startSec: number;
+  endSec: number;
+  /** Defaults to "ask" natively when absent, matching the app default. */
+  skipMode?: NativePlayerSegmentSkipMode;
+};
+
+export type NativePlayerTrickplay = {
+  intervalMs: number;
+  /** Tiles per row (Jellyfin TileWidth). */
+  tileCols: number;
+  /** Tiles per column (Jellyfin TileHeight). */
+  tileRows: number;
+  /** Pixels per thumbnail. */
+  thumbWidth: number;
+  thumbHeight: number;
+  /**
+   * Fully-formed per-sheet URLs, index = sheet index. Online these carry
+   * the ApiKey query param; offline they are file:// paths.
+   */
+  sheetUrls: string[];
+  headers?: Record<string, string>;
+};
+
+export type NativePlayerNextEpisode = {
+  itemId: string;
+  title: string;
+  subtitle?: string;
+  imageUrl?: string;
+  /** 0 = no auto-countdown; show the "Next episode" button only. */
+  countdownSeconds?: number;
+  /**
+   * The "Still watching?" preset is due (utils/stillWatching.ts): EOF shows
+   * the card instead of auto-advancing (countdownSeconds is 0 in that case).
+   * Continue emits onNextEpisodeRequested with reason "userTap", which
+   * starts a new session JS-side.
+   */
+  stillWatchingRequired?: boolean;
+};
+
+export type NativePlayerTrackMenuItem = {
+  label: string;
+  jellyfinIndex: number;
+  selected?: boolean;
+  /**
+   * Selecting this item forces a stream re-negotiation (burned-in subtitle,
+   * audio change while transcoding) — native won't optimistically checkmark
+   * it; push updateTrackMenus with the truth after applying.
+   */
+  requiresReload?: boolean;
+};
+
+export type NativePlayerTrackMenus = {
+  /** Include the "Off" item (jellyfinIndex = -1), labeled via i18n. */
+  subtitles: NativePlayerTrackMenuItem[];
+  audio: NativePlayerTrackMenuItem[];
+  /**
+   * Max-bitrate options (online only; omit/empty offline). jellyfinIndex
+   * carries the bitrate in bps, -1 = "Max". Selection always re-negotiates.
+   */
+  quality?: NativePlayerTrackMenuItem[];
+};
+
+export type NativePlayerEpisodeListItem = {
+  itemId: string;
+  title: string;
+  indexNumber?: number;
+  imageUrl?: string;
+  /** 0-100 watched progress. */
+  progressPercent?: number;
+  isCurrent?: boolean;
+};
+
+/** One remote subtitle hit (display model; logic stays in the coordinator). */
+export type NativePlayerSubtitleSearchResult = {
+  id: string;
+  name: string;
+  providerName: string;
+  format?: string;
+  language?: string;
+  communityRating?: number;
+  downloadCount?: number;
+  isHashMatch?: boolean;
+  hearingImpaired?: boolean;
+  aiTranslated?: boolean;
+};
+
+/** Pushed via updateSubtitleSearch to drive the native search sheet. */
+export type NativePlayerSubtitleSearchState = {
+  status:
+    | "idle"
+    | "searching"
+    | "results"
+    | "error"
+    | "downloading"
+    | "applied";
+  results?: NativePlayerSubtitleSearchResult[];
+  /** Localized by JS; native only displays it. */
+  errorMessage?: string;
+};
+
+export type NativePlayerSubtitleStyle = {
+  scale?: number;
+  /** Platform calibration applied natively before surface compensation. */
+  renderScaleMultiplier?: number;
+  scaleLocked?: boolean;
+  marginY?: number;
+  alignX?: "left" | "center" | "right";
+  alignY?: "top" | "center" | "bottom";
+  color?: string;
+  font?: string;
+  background?: string;
+  backgroundPadding?: number;
+  assOverride?: "no" | "force";
+};
+
+/**
+ * Localized labels handed to the native UI; English fallbacks apply.
+ * endsAt carries a literal %TIME% placeholder and stopPlayingTitle a literal
+ * %TITLE% placeholder — the native side substitutes both.
+ */
+export type NativePlayerStrings = Partial<
+  Record<
+    | "skipIntro"
+    | "skipCredits"
+    | "skipRecap"
+    | "skipCommercial"
+    | "skipPreview"
+    | "segmentSkippedIntro"
+    | "segmentSkippedOutro"
+    | "segmentSkippedRecap"
+    | "segmentSkippedCommercial"
+    | "segmentSkippedPreview"
+    | "nextEpisode"
+    | "playNow"
+    | "cancel"
+    | "episodes"
+    | "speed"
+    | "audio"
+    | "subtitles"
+    | "chapters"
+    | "technicalInfo"
+    | "playbackError"
+    | "close"
+    | "reset"
+    | "off"
+    | "quality"
+    | "subtitleSize"
+    | "subtitleSync"
+    | "audioSync"
+    | "volumeBoost"
+    | "dialogueBoost"
+    | "monoAudio"
+    | "rotate"
+    | "lockControls"
+    | "unlock"
+    | "stillWatching"
+    | "continueWatching"
+    | "goBack"
+    | "endsAt"
+    | "zoomToFill"
+    | "stop"
+    | "stopPlayback"
+    | "stopPlayingTitle"
+    | "stopPlayingConfirm"
+    | "sleepTimer"
+    | "sleepTimerOff"
+    | "searchSubtitles"
+    | "searchFailed"
+    | "noSubtitlesFound"
+    | "nowPlaying",
+    string
+  >
+>;
+
+export type NativePlayerUIOptions = {
+  orientationLock?: "landscape" | "none";
+  allowPip?: boolean;
+  seekForwardSec?: number;
+  seekBackwardSec?: number;
+  initialPlaybackSpeed?: number;
+  /** false disables all in-player haptics (settings.disableHapticFeedback). */
+  hapticsEnabled?: boolean;
+  /** false hides the right-edge volume slider (settings.hideVolumeSlider). */
+  showVolumeSlider?: boolean;
+  /** false hides the left-edge brightness slider (settings.hideBrightnessSlider). */
+  showBrightnessSlider?: boolean;
+  /** false disables the horizontal drag that scrubs (settings.enableHorizontalSwipeSkip). */
+  horizontalSwipeSeekEnabled?: boolean;
+  /** false disables the left-half vertical drag for brightness (settings.enableLeftSideBrightnessSwipe). */
+  brightnessSwipeEnabled?: boolean;
+  /** false disables the right-half vertical drag for volume (settings.enableRightSideVolumeSwipe). */
+  volumeSwipeEnabled?: boolean;
+  /** false disables press-and-hold speed boosting (settings.enableHoldToSpeed). */
+  holdToSpeedEnabled?: boolean;
+  /** Speed applied while press-and-hold is held (settings.holdToSpeedRate). */
+  holdToSpeedRate?: number;
+  /** false disables pinch to zoom-to-fill (settings.enablePinchToZoom). */
+  pinchToZoomEnabled?: boolean;
+  /** true enables double tap on the video halves to seek (settings.enableDoubleTapToSeek). */
+  doubleTapToSeekEnabled?: boolean;
+  /** false skips the "Stop playback?" dialog on Back/Menu (settings.confirmBeforeStoppingPlayback). TV only. */
+  confirmExitEnabled?: boolean;
+  /** Remote subtitle search entry in the subtitles menu (online only). */
+  subtitleSearchEnabled?: boolean;
+  /** ISO 639-2 codes + localized display names for the language picker. */
+  subtitleSearchLanguages?: { code: string; name: string }[];
+  subtitleSearchDefaultLanguage?: string;
+  strings?: NativePlayerStrings;
+};
+
+/**
+ * Which engine decodes the stream inside the native chrome. Android-only:
+ * iOS's chrome always runs mpv and ignores the field. Defaults to "mpv"
+ * when absent (older configs, mobile).
+ */
+export type NativePlayerEngine = "mpv" | "exoplayer";
+
+/** Server-owned SyncPlay state rendered by SwiftUI / Compose. */
+export type NativePlayerSyncPlayState = {
+  groupId: string;
+  groupName: string;
+  status: string;
+  connected: boolean;
+  busy: boolean;
+  error?: string;
+  playlist: {
+    itemId: string;
+    playlistItemId: string;
+    title: string;
+    subtitle?: string;
+    /** Poster. Loaded with the config's image headers. */
+    imageUrl?: string;
+  }[];
+  currentPlaylistItemId?: string;
+  repeatMode: "RepeatNone" | "RepeatOne" | "RepeatAll";
+  shuffleMode: "Sorted" | "Shuffle";
+  ignoreWait: boolean;
+  hasNext: boolean;
+  hasPrevious: boolean;
+  strings: Record<string, string>;
+};
+
+/** Corrected client deadline; native owns scheduling and decoder operations. */
+export type NativePlayerSyncPlayCommand = {
+  commandId: string;
+  groupId: string;
+  playlistItemId: string;
+  command: "Pause" | "Unpause" | "Seek" | "Stop";
+  executeAtMs: number;
+  positionSec: number;
+};
+
+export type NativePlayerSyncPlayAction = {
+  action:
+    | "play"
+    | "pause"
+    | "seek"
+    | "next"
+    | "previous"
+    | "stop"
+    | "leave"
+    // Out of the group because the app went away, not because the user asked.
+    | "suspend"
+    | "refresh"
+    | "repeat"
+    | "shuffle"
+    | "ignoreWait"
+    | "select"
+    | "remove"
+    | "move"
+    | "clear"
+    | "ended";
+  positionSec?: number;
+  playlistItemId?: string;
+  newIndex?: number;
+  mode?: string;
+  value?: boolean;
+};
+
+export type NativePlayerConfig = {
+  stream: NativePlayerStreamConfig;
+  metadata?: NativePlayerMetadata;
+  /**
+   * Custom proxy auth headers for the thumbnails the player loads itself
+   * (episode list, next episode). Same server as the stream.
+   */
+  imageHeaders?: Record<string, string>;
+  chapters?: NativePlayerChapter[];
+  segments?: NativePlayerSegment[];
+  trickplay?: NativePlayerTrickplay;
+  nextEpisode?: NativePlayerNextEpisode;
+  episodeList?: NativePlayerEpisodeListItem[];
+  tracks?: NativePlayerTrackMenus;
+  subtitleStyle?: NativePlayerSubtitleStyle;
+  ui?: NativePlayerUIOptions;
+  engine?: NativePlayerEngine;
+  /**
+   * mpv's video output driver, the "Video output" setting. Android-only and
+   * mpv-only: absent on iOS and for ExoPlayer. Defaults to "gpu-next" when
+   * absent.
+   */
+  voDriver?: "gpu-next" | "gpu";
+  syncPlay?: NativePlayerSyncPlayState;
+};
+
+// MARK: - Events
+
+export type NativePlayerProgressPayload = {
+  position: number;
+  duration: number;
+  progress: number;
+  cacheSeconds: number;
+  /** Present (true) on the first authoritative tick after a user/remote seek. */
+  didSeek?: boolean;
+  /**
+   * Present (true) on the synthetic tick a seek emits immediately. It carries
+   * the requested target rather than where mpv landed, so the progress
+   * listener moves the tracked position and skips its own report; the next
+   * authoritative tick (didSeek) reports the landed position. Reports that
+   * read the tracked position for other reasons, such as a pause transition,
+   * can still carry the target.
+   */
+  trackingOnly?: boolean;
+};
+
+export type NativePlayerStateChangePayload = {
+  isPaused?: boolean;
+  isPlaying?: boolean;
+  isLoading?: boolean;
+  isReadyToSeek?: boolean;
+};
+
+export type NativePlayerTrackSelectionRequest = {
+  kind: "subtitle" | "audio";
+  jellyfinIndex: number;
+  positionSec: number;
+};
+
+export type NativePlayerNextEpisodeRequest = {
+  reason: "userTap" | "countdown";
+  positionSec: number;
+};
+
+export type NativePlayerDismissReason =
+  | "closeButton"
+  | "programmatic"
+  | "playbackEnded"
+  | "error";
+
+export type NativePlayerDismissPayload = {
+  positionSec: number;
+  durationSec: number;
+  reason: NativePlayerDismissReason;
+};
+
+export type NativePlayerEvents = {
+  onSyncPlayAction: (payload: NativePlayerSyncPlayAction) => void;
+  /**
+   * `muted` is the combined device-volume + player mute at load time, and
+   * `isPlaying` the play state the engine was just given.
+   */
+  onLoad: (payload: {
+    url: string;
+    muted?: boolean;
+    isPlaying?: boolean;
+  }) => void;
+  onProgress: (payload: NativePlayerProgressPayload) => void;
+  onPlaybackStateChange: (payload: NativePlayerStateChangePayload) => void;
+  onError: (payload: { error: string }) => void;
+  /**
+   * Fired after embedded track enumeration AND again after each external
+   * sub-add — re-run the subtitle identity resolution on every fire.
+   */
+  onTracksReady: (payload: Record<string, never>) => void;
+  onPictureInPictureChange: (payload: { isActive: boolean }) => void;
+  onTrackSelectionRequested: (
+    payload: NativePlayerTrackSelectionRequest,
+  ) => void;
+  onSpeedChange: (payload: { speed: number }) => void;
+  /** Quality menu tap; bitrateValue in bps, -1 = "Max" (no limit), -2 = "Auto". */
+  onQualitySelected: (payload: {
+    bitrateValue: number;
+    positionSec: number;
+  }) => void;
+  /** In-player subtitle size change; persist as settings.subtitleSize. */
+  onSubtitleScaleChange: (payload: { scale: number }) => void;
+  /**
+   * In-player rotate button. The native VC already flipped its own mask and
+   * requested the geometry change, but when JS holds a window-level
+   * expo-screen-orientation lock (landscape-on-open setting) it outvotes the
+   * VC — JS must re-lock to the requested orientation.
+   */
+  onOrientationChangeRequested: (payload: {
+    orientation: "portrait" | "landscape";
+  }) => void;
+  onNextEpisodeRequested: (payload: NativePlayerNextEpisodeRequest) => void;
+  onPreviousEpisodeRequested: (payload: { positionSec: number }) => void;
+  onEpisodeSelected: (payload: { itemId: string; positionSec: number }) => void;
+  /** EOF with no next episode configured; native auto-dismisses after this. */
+  onPlaybackEnded: (payload: { positionSec: number }) => void;
+  onDismiss: (payload: NativePlayerDismissPayload) => void;
+  /** Search sheet opened / language changed; answer via updateSubtitleSearch. */
+  onSubtitleSearchRequested: (payload: { language: string }) => void;
+  /** A result row was tapped; resultId keys into the last pushed results. */
+  onSubtitleDownloadRequested: (payload: {
+    resultId: string;
+    positionSec: number;
+  }) => void;
+  /**
+   * System volume crossed zero (either direction). JS may auto-enable
+   * subtitles while muted (settings.subtitlesOnMute) and revert on unmute.
+   */
+  onMuteStateChanged: (payload: {
+    muted: boolean;
+    positionSec: number;
+  }) => void;
+};

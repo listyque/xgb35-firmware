@@ -1,0 +1,124 @@
+// Registers the tsx require hook so the TypeScript config plugins referenced
+// from app.json ("./plugins/*.ts") can be loaded by Node during config evaluation.
+import "tsx/cjs";
+import { execFileSync } from "node:child_process";
+import type { ConfigContext, ExpoConfig } from "expo/config";
+
+// Build metadata, injected into `extra.build` and read at runtime via
+// expo-constants (see utils/version.ts). Sources in priority order:
+// EAS cloud build → GitHub Actions → explicit EXPO_PUBLIC_* → local git → null.
+const git = (args: string[]): string | null => {
+  try {
+    return execFileSync("git", args, { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
+};
+
+const buildMeta = {
+  commit:
+    (
+      process.env.EAS_BUILD_GIT_COMMIT_HASH ||
+      process.env.GITHUB_SHA ||
+      process.env.EXPO_PUBLIC_GIT_COMMIT ||
+      git(["rev-parse", "HEAD"]) ||
+      ""
+    ).slice(0, 7) || null,
+  branch:
+    process.env.EAS_BUILD_GIT_BRANCH ||
+    process.env.GITHUB_HEAD_REF ||
+    process.env.GITHUB_REF_NAME ||
+    process.env.EXPO_PUBLIC_GIT_BRANCH ||
+    git(["rev-parse", "--abbrev-ref", "HEAD"]) ||
+    null,
+  profile:
+    process.env.EAS_BUILD_PROFILE ||
+    process.env.EXPO_PUBLIC_BUILD_PROFILE ||
+    null,
+  // GitHub Actions run number (#2098) — lets anyone map a sideloaded CI build back
+  // to its Actions run (artifacts + logs) without Expo access. Null outside CI.
+  runNumber:
+    process.env.GITHUB_RUN_NUMBER ||
+    process.env.EXPO_PUBLIC_GIT_RUN_NUMBER ||
+    null,
+  builtAt: new Date().toISOString(),
+};
+
+export default ({ config }: ConfigContext): ExpoConfig => {
+  const env = process.env;
+  if (process.env.EXPO_TV !== "1") {
+    config.plugins?.push("expo-background-task");
+
+    // Has iOS stop the receiver when casting is stopped, as Android does. Mods
+    // run in reverse order, so this edits the cast options the library's
+    // plugin below writes.
+    config.plugins?.push("./plugins/withCastStopReceiverOnEnd.ts");
+
+    // F007D354 is Jellyfin's own Cast receiver: unlike the default Google
+    // receiver it authenticates against the server and reports playback, so a
+    // cast shows up in the dashboard and in the user's watch history.
+    config.plugins?.push([
+      "react-native-google-cast",
+      {
+        useDefaultExpandedMediaControls: true,
+        receiverAppId: "F007D354",
+      },
+    ]);
+
+    config.plugins?.push([
+      "expo-camera",
+      {
+        cameraPermission:
+          "Allow Streamyfin to access the camera to scan QR codes for TV login.",
+      },
+    ]);
+  }
+
+  // Sentry source-map/dSYM upload needs SENTRY_AUTH_TOKEN; without it the
+  // injected build phases fail Release builds outright. Disable upload unless
+  // the token is present (EAS secret / CI env), so it self-enables with it.
+  for (const plugin of config.plugins ?? []) {
+    if (Array.isArray(plugin) && plugin[0] === "@sentry/react-native/expo") {
+      plugin[1] = {
+        ...plugin[1],
+        disableAutoUpload: !process.env.SENTRY_AUTH_TOKEN,
+      };
+    }
+  }
+
+  config.extra = { ...config.extra, build: buildMeta };
+  if (
+    env.EXPO_PUBLIC_STREAMYFIN_LOCAL_ANDROID === "1" &&
+    config.android?.package
+  ) {
+    config.name = `${config.name} Local`;
+    config.scheme = "streamyfin-local";
+    config.android.package += ".local";
+    config.android.permissions = [
+      ...new Set([
+        ...(config.android.permissions ?? []),
+        "android.permission.REQUEST_INSTALL_PACKAGES",
+      ]),
+    ];
+    config.android.versionCode = Number(env.STREAMYFIN_LOCAL_VERSION_CODE ?? 2);
+    // The official Firebase Android client is registered to the original package.
+    delete config.android.googleServicesFile;
+    config.plugins?.push(["expo-dev-client", { addGeneratedScheme: false }]);
+  } else if (process.env.GOOGLE_SERVICES_JSON && config.android) {
+    config.android.googleServicesFile = process.env.GOOGLE_SERVICES_JSON;
+  }
+
+  // A repack (scripts/ci) passes the build number of the IPA it starts from:
+  // repack-app writes the config's, or "1", into the app and its extensions,
+  // and an EAS build's number would be lost.
+  if (process.env.REPACK_IOS_BUILD_NUMBER) {
+    config.ios = {
+      ...config.ios,
+      buildNumber: process.env.REPACK_IOS_BUILD_NUMBER,
+    };
+  }
+
+  return config as ExpoConfig;
+};

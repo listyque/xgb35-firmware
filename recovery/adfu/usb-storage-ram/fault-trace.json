@@ -1,0 +1,9 @@
+{
+  "event": "kernel_init",
+  "r0": "0x0",
+  "r2": "0xc146dfa0",
+  "pc": "0x0",
+  "dfar": "0x772ad44",
+  "dfsr": "0x141e",
+  "ifsr": "0x1000"
+}

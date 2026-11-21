@@ -1,0 +1,137 @@
+--- a/services4/srvclient/env/linux/common/osfunc_um.c
++++ b/services4/srvclient/env/linux/common/osfunc_um.c
+@@ -265,7 +265,7 @@
+ 	struct timespec stReq, stRem;
+ 	IMG_INT iRes;
+ 
+-	stReq.tv_sec = (__time_t)(ui32Timeus / 1000000);
++	stReq.tv_sec = (time_t)(ui32Timeus / 1000000);
+ 	stReq.tv_nsec = (IMG_INT32)((ui32Timeus % 1000000) * 1000);
+ 
+ 	do
+@@ -341,7 +341,7 @@
+ 	struct timespec stReq, stRem;
+ 	IMG_INT iRes;
+ 
+-	stReq.tv_sec = (__time_t)(ui32Timeus / 1000000);
++	stReq.tv_sec = (time_t)(ui32Timeus / 1000000);
+ 	stReq.tv_nsec = (IMG_INT32)((ui32Timeus % 1000000) * 1000);
+ 
+ 	do {
+--- a/services4/srvclient/env/linux/common/pvr_apphint.c
++++ b/services4/srvclient/env/linux/common/pvr_apphint.c
+@@ -12,7 +12,9 @@
+ #include <errno.h>
+ #include <unistd.h>
+ 
++#if defined(ANDROID) /* Android board-specific hints */
+ #include <cutils/properties.h> /* Android header */
++#endif
+ 
+ #include "pvr_debug.h"
+ #include "img_defs.h"
+@@ -40,6 +42,7 @@
+ 	PARSE_STATE_HINT_VALUE_STRING  /* Reading a string hint value. */
+ };
+ 
++#if defined(ANDROID)
+ static const char *variant_keys[] = {
+ 	"ro.board.platform", /* e.g. omap4 */
+ 	"ro.product.processor", /* TI specific property, e.g. omap4470 */
+@@ -49,6 +52,7 @@
+ 
+ static const int HAL_VARIANT_KEYS_COUNT =
+     (sizeof(variant_keys)/sizeof(variant_keys[0]));
++#endif
+ 
+ /***********************************************************************************
+  Function Name      : GetApplicationName
+@@ -358,6 +362,7 @@
+  Description        : Searches for hardware specific versions of powervr.ini by
+ 					  getting the values of various Android properties.
+ ************************************************************************************/
++#if defined(ANDROID)
+ static IMG_BOOL FindAppHintVariant(const IMG_CHAR *pszAppName,
+ 							const IMG_CHAR *pszHintName, IMG_VOID *pReturn,
+ 							IMG_DATA_TYPE eDataType)
+@@ -383,6 +388,7 @@
+ 	}
+ 	return bFound;
+ }
++#endif
+ 
+ /***********************************************************************************
+  Function Name      : FindAppHint
+@@ -422,11 +428,14 @@
+ 				bFound = IMG_TRUE;
+ 			}
+ 
++#if defined(ANDROID)
+ 			if (FindAppHintVariant(pszAppName, pszHintName, pReturn, eDataType))
+ 			{
+ 				bFound = IMG_TRUE;
+ 			}
+-
++#endif
++
++            if (getenv("XGB35_PVR_INI") && FindAppHintInFile(getenv("XGB35_PVR_INI"), pszAppName, pszHintName, pReturn, eDataType)) bFound = IMG_TRUE;
+ 			/* Try local hint file, if present */
+ 			if(FindAppHintInFile("powervr.ini", pszAppName, pszHintName, pReturn, eDataType))
+ 			{
+--- a/services4/srvinit/env/linux/pvrsrvctl.c
++++ b/services4/srvinit/env/linux/pvrsrvctl.c
+@@ -118,7 +118,7 @@
+ 	return IMG_TRUE;
+ 
+ err_out:
+-	fclose(pFile);
++	if (pFile) fclose(pFile);
+ 	return IMG_FALSE;
+ }
+ 
+@@ -264,10 +264,6 @@
+ 		{ NULL, 0, NULL, 0 },
+ 	};
+ 
+-	if(!DetectPlatform(&props)) {
+-		DPF("Could not detect platform\n");
+-		goto err_out;
+-	}
+ 
+ 	while(1)
+ 	{
+@@ -295,6 +291,10 @@
+ 		goto err_out;
+ 	}
+ 
++	if(iModule && !DetectPlatform(&props)) {
++		DPF("Could not detect platform\n");
++		goto err_out;
++	}
+ 	if(iModule && (iMode == RESTART || iMode == STOP))
+ 	{
+ 		if(!UnloadModules(props.sgx_core, props.sgx_rev))
+--- a/tools/intern/oglcompiler/parser/tokens.h
++++ b/tools/intern/oglcompiler/parser/tokens.h
+@@ -26,6 +26,8 @@
+ #include "img_types.h"
+ 
+ #define TokenName enum yytokentype
++typedef struct ParseContextTAG ParseContext;
++typedef struct GLSLTreeContextTAG GLSLTreeContext;
+ #include "glsl_parser.tab.h"
+ 
+ #ifdef SRC_DEBUG
+--- a/tools/intern/useasm/cparser.y
++++ b/tools/intern/useasm/cparser.y
+@@ -85,8 +85,8 @@
+ #define YYLTYPE YYLTYPE
+ 
+ # define YYLLOC_DEFAULT(Current, Rhs, N) \
+-	Current.pszFilename = (Rhs)->pszFilename; \
+-	Current.uLine = (Rhs)->uLine;
++	(Current).pszFilename = (Rhs)->pszFilename; \
++	(Current).uLine = (Rhs)->uLine;
+ 
+ const char* yyvalue(int yychar, int yytype);
+ 

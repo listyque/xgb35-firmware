@@ -1,0 +1,831 @@
+import { RECEIVER_CHANNEL_OPEN_ATTEMPTS } from "@/constants/Cast";
+import {
+  CAST_DOUBLE_DEVICE_ID,
+  createCastDoubleState,
+  fireCastSessionEvent,
+  lastCastChannel,
+} from "@/test-utils/googleCast";
+import { makeApi } from "@/test-utils/jellyfinApi";
+import {
+  castToJellyfinReceiver,
+  currentReceiverName,
+  JELLYFIN_CAST_NAMESPACE,
+  playOnJellyfinReceiver,
+  queueWindow,
+  receiverNameFor,
+  sendJellyfinCastCommand,
+  subscribeToJellyfinReceiverMessages,
+  toReceiverDeviceName,
+  watchReceiverLoadErrors,
+} from "./jellyfinReceiver";
+
+const mockCast = createCastDoubleState();
+jest.mock("react-native-google-cast", () =>
+  // The factory runs before this file's body, so the state is read lazily.
+  require("@/test-utils/googleCast").castDoubleModule(() => mockCast),
+);
+
+const lastChannel = () => lastCastChannel(mockCast);
+
+let nextSession = 0;
+
+beforeEach(() => {
+  // The module caches its channel per Cast session, so each test starts on a
+  // session of its own rather than on whatever the last one left open.
+  nextSession += 1;
+  mockCast.sessionId = `session-${nextSession}`;
+  mockCast.device = {
+    friendlyName: "Living Room TV",
+    deviceId: CAST_DOUBLE_DEVICE_ID,
+  };
+  mockCast.channels = [];
+  mockCast.connectOnAdd = true;
+  mockCast.holdAdd = null;
+  mockCast.renewSessionOnAdd = false;
+});
+
+describe("playOnJellyfinReceiver", () => {
+  test("hands the receiver the server, the user and the chosen streams", async () => {
+    const api = makeApi();
+
+    await playOnJellyfinReceiver(
+      { api, userId: "user-1", receiverName: "Salon", maxBitrate: 8_000_000 },
+      {
+        items: [
+          {
+            Id: "item-1",
+            Name: "Festen",
+            Type: "Movie",
+            MediaType: "Video",
+            Overview: "Not needed by the receiver",
+            MediaSources: [{ Id: "source-1" }],
+          },
+        ],
+        startPositionTicks: 42,
+        mediaSourceId: "source-1",
+        audioStreamIndex: 2,
+        subtitleStreamIndex: 5,
+      },
+    );
+
+    expect(lastChannel().sendMessage).toHaveBeenCalledWith({
+      command: "PlayNow",
+      serverAddress: "https://jellyfin.example.com",
+      accessToken: "SECRET_TOKEN",
+      userId: "user-1",
+      receiverName: "Salon",
+      maxBitrate: 8_000_000,
+      options: {
+        items: [
+          {
+            Id: "item-1",
+            Name: "Festen",
+            Type: "Movie",
+            MediaType: "Video",
+            IsFolder: false,
+          },
+        ],
+        startPositionTicks: 42,
+        mediaSourceId: "source-1",
+        audioStreamIndex: 2,
+        subtitleStreamIndex: 5,
+      },
+    });
+  });
+
+  test("casts a live program through its channel, from the live edge", async () => {
+    // The receiver has no program-to-channel lookup: handed the program, it
+    // asks PlaybackInfo for an item with no media and the TV stays idle.
+    await playOnJellyfinReceiver(
+      { api: makeApi(), userId: "user-1" },
+      {
+        items: [
+          {
+            Id: "program-1",
+            Name: "Evening News",
+            Type: "Program",
+            ChannelId: "channel-1",
+            ChannelName: "News 24",
+          },
+        ],
+        startPositionTicks: 600_000_000,
+        mediaSourceId: "program-1",
+        audioStreamIndex: 1,
+        subtitleStreamIndex: 3,
+      },
+    );
+
+    const [message] = lastChannel().sendMessage.mock.calls[0];
+    expect(message.options).toEqual({
+      items: [
+        {
+          Id: "channel-1",
+          Name: "News 24",
+          Type: "TvChannel",
+          MediaType: "Video",
+          IsFolder: false,
+        },
+      ],
+    });
+  });
+
+  test("leaves out the receiver name and bitrate when there are none", async () => {
+    await sendJellyfinCastCommand("Stop", { api: makeApi(), userId: "user-1" });
+
+    const [message] = lastChannel().sendMessage.mock.calls[0];
+    expect(message).not.toHaveProperty("receiverName");
+    expect(message).not.toHaveProperty("maxBitrate");
+  });
+});
+
+describe("receiver channel", () => {
+  test("is opened on the Jellyfin namespace and reused while connected", async () => {
+    const session = { api: makeApi(), userId: "user-1" };
+
+    await sendJellyfinCastCommand("Pause", session);
+    await sendJellyfinCastCommand("Unpause", session);
+
+    expect(mockCast.channels).toHaveLength(1);
+    expect(JELLYFIN_CAST_NAMESPACE).toBe("urn:x-cast:com.connectsdk");
+  });
+
+  test("is opened again for a new Cast session, and the old one removed", async () => {
+    // Android never marks a channel disconnected, so a session change is the
+    // only sign that the receiver callbacks have to be registered again.
+    const session = { api: makeApi(), userId: "user-1" };
+
+    await sendJellyfinCastCommand("Pause", session);
+    const previous = lastChannel();
+    mockCast.sessionId = "session-next";
+    await sendJellyfinCastCommand("Unpause", session);
+
+    expect(mockCast.channels).toHaveLength(2);
+    expect(previous.remove).toHaveBeenCalled();
+  });
+
+  test.each(["ended", "suspended", "resumed"])(
+    "is opened again after a session %s event, with the same session id",
+    async (event) => {
+      // Rejoining a receiver that kept playing gives back the same session id,
+      // but the old channel was registered on the session object that is gone.
+      const session = { api: makeApi(), userId: "user-1" };
+
+      await sendJellyfinCastCommand("Pause", session);
+      const previous = lastChannel();
+      fireCastSessionEvent(mockCast, event);
+      await sendJellyfinCastCommand("Unpause", session);
+
+      expect(mockCast.channels).toHaveLength(2);
+      expect(previous.remove).toHaveBeenCalled();
+      expect(previous.sendMessage).toHaveBeenCalledTimes(1);
+      expect(lastChannel().sendMessage).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("opens one channel for two commands sent at once", async () => {
+    // Both would otherwise register on the session, with only the last one
+    // tracked and the other left behind for good.
+    let release = () => {};
+    mockCast.holdAdd = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const session = { api: makeApi(), userId: "user-1" };
+
+    const commands = Promise.all([
+      sendJellyfinCastCommand("Pause", session),
+      sendJellyfinCastCommand("Unpause", session),
+    ]);
+    release();
+    await commands;
+
+    expect(mockCast.channels).toHaveLength(1);
+    expect(lastChannel().sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  test("opens a channel for the session the command is sent on", async () => {
+    // The session can change while the open is pending; the old session's
+    // channel would reach the receiver that is no longer there.
+    let release = () => {};
+    mockCast.holdAdd = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const command = sendJellyfinCastCommand("Pause", {
+      api: makeApi(),
+      userId: "user-1",
+    });
+
+    mockCast.sessionId = "session-after";
+    mockCast.holdAdd = null;
+    release();
+    await command;
+
+    expect(mockCast.channels).toHaveLength(2);
+    expect(mockCast.channels[0].sendMessage).not.toHaveBeenCalled();
+    expect(mockCast.channels[0].remove).toHaveBeenCalled();
+    expect(mockCast.channels[1].sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("gives up when the Cast session changes on every try", async () => {
+    mockCast.renewSessionOnAdd = true;
+
+    await expect(
+      sendJellyfinCastCommand("Pause", { api: makeApi(), userId: "user-1" }),
+    ).rejects.toThrow("the Cast session keeps changing");
+    expect(mockCast.channels).toHaveLength(RECEIVER_CHANNEL_OPEN_ATTEMPTS);
+    expect(
+      mockCast.channels.every(
+        (channel) => !channel.sendMessage.mock.calls.length,
+      ),
+    ).toBe(true);
+  });
+
+  test("refuses to send when the channel does not connect", async () => {
+    mockCast.connectOnAdd = false;
+
+    await expect(
+      sendJellyfinCastCommand("Pause", { api: makeApi(), userId: "user-1" }),
+    ).rejects.toThrow("not connected");
+  });
+
+  test("parses the raw JSON the native modules hand over", async () => {
+    // Both native modules pass the receiver's payload as a string; read as an
+    // object it has no `type` and every receiver error goes unnoticed.
+    const received: unknown[] = [];
+    subscribeToJellyfinReceiverMessages((message) => received.push(message));
+    await sendJellyfinCastCommand("Pause", {
+      api: makeApi(),
+      userId: "user-1",
+    });
+
+    lastChannel().receive('{"type":"connectionerror","message":""}');
+    lastChannel().receive("not json");
+
+    expect(received).toEqual([
+      { type: "connectionerror", message: "" },
+      "not json",
+    ]);
+  });
+
+  test("passes receiver messages to subscribers until they unsubscribe", async () => {
+    const received: unknown[] = [];
+    const unsubscribe = subscribeToJellyfinReceiverMessages((message) =>
+      received.push(message),
+    );
+    await sendJellyfinCastCommand("Pause", {
+      api: makeApi(),
+      userId: "user-1",
+    });
+
+    lastChannel().receive({ type: "connectionerror", message: "" });
+    unsubscribe();
+    lastChannel().receive({ type: "error", message: "ignored" });
+
+    expect(received).toEqual([{ type: "connectionerror", message: "" }]);
+  });
+});
+
+describe("queueWindow", () => {
+  const tracks = Array.from({ length: 250 }, (_, i) => `track-${i}`);
+
+  test("sends a short queue whole", () => {
+    expect(queueWindow(tracks.slice(0, 5), 3, 100)).toEqual({
+      items: tracks.slice(0, 5),
+      startIndex: 3,
+    });
+  });
+
+  test("keeps a track picked past the limit in what gets sent", () => {
+    const { items, startIndex } = queueWindow(tracks, 120, 100);
+
+    expect(items).toHaveLength(100);
+    expect(items[startIndex]).toBe("track-120");
+  });
+
+  test("fills the window backwards near the end of the queue", () => {
+    const { items, startIndex } = queueWindow(tracks, 249, 100);
+
+    expect(items[0]).toBe("track-150");
+    expect(items[startIndex]).toBe("track-249");
+  });
+
+  test("clamps an index outside the queue", () => {
+    expect(queueWindow(tracks.slice(0, 3), 7, 100).startIndex).toBe(2);
+  });
+});
+
+describe("watchReceiverLoadErrors", () => {
+  const openChannel = () =>
+    sendJellyfinCastCommand("Pause", { api: makeApi(), userId: "user-1" });
+
+  test("reports the first load error, then stops listening", async () => {
+    await openChannel();
+    const errors: string[] = [];
+    watchReceiverLoadErrors((error) => errors.push(error), 1_000);
+
+    lastChannel().receive('{"type":"playbackprogress"}');
+    lastChannel().receive('{"type":"connectionerror","message":""}');
+    lastChannel().receive('{"type":"playbackerror","message":"NoStream"}');
+
+    expect(errors).toEqual(["server_unreachable"]);
+  });
+
+  test("only reports for the latest cast command", async () => {
+    await openChannel();
+    const first: string[] = [];
+    const second: string[] = [];
+    watchReceiverLoadErrors((error) => first.push(error), 1_000);
+    watchReceiverLoadErrors((error) => second.push(error), 1_000);
+
+    lastChannel().receive({ type: "error", message: "Missing params" });
+
+    expect(first).toEqual([]);
+    expect(second).toEqual(["rejected"]);
+  });
+
+  test("stops listening once the window is over", async () => {
+    await openChannel();
+    const errors: string[] = [];
+    watchReceiverLoadErrors((error) => errors.push(error), 5);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    lastChannel().receive({ type: "playbackerror", message: "late" });
+
+    expect(errors).toEqual([]);
+  });
+
+  test("stops listening when the command could not be sent", async () => {
+    await openChannel();
+    const errors: string[] = [];
+    const stop = watchReceiverLoadErrors((error) => errors.push(error), 1_000);
+
+    stop();
+    lastChannel().receive({ type: "connectionerror", message: "" });
+
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("currentReceiverName", () => {
+  test("reads the device name off the live Cast session", async () => {
+    expect(await currentReceiverName()).toBe("Living Room TV");
+  });
+
+  test("is undefined with no session or no device name", async () => {
+    mockCast.sessionId = undefined;
+    expect(await currentReceiverName()).toBeUndefined();
+
+    mockCast.sessionId = "session-x";
+    mockCast.device = null;
+    expect(await currentReceiverName()).toBeUndefined();
+  });
+
+  test("gives a TV with no ASCII letter in its name one the receiver can use", async () => {
+    mockCast.device = {
+      friendlyName: "Гостиная",
+      deviceId: CAST_DOUBLE_DEVICE_ID,
+    };
+    expect(await currentReceiverName()).toBe("Chromecast 0b9c8d7e");
+  });
+});
+
+describe("receiverNameFor", () => {
+  const deviceId = "4f0c2b9d8e7a6b5c4d3e2f1a0b9c8d7e";
+
+  test("passes a name the receiver can take through unchanged", () => {
+    // The receiver then names the TV exactly as it does for jellyfin-web.
+    expect(receiverNameFor({ friendlyName: "Télé du salon", deviceId })).toBe(
+      "Télé du salon",
+    );
+    expect(
+      receiverNameFor({ friendlyName: 'Salon (TV) — 55"', deviceId }),
+    ).toBe('Salon (TV) — 55"');
+  });
+
+  test("swaps whitespace the receiver cannot encode for a plain space", () => {
+    expect(
+      receiverNameFor({ friendlyName: "Living\u3000Room\u202fTV", deviceId }),
+    ).toBe("Living Room TV");
+  });
+
+  test.each(["Гостиная", "客厅电视", "リビング\u3000テレビ", ""])(
+    "names a TV called %p after its Cast device id",
+    (friendlyName) => {
+      expect(receiverNameFor({ friendlyName, deviceId })).toBe(
+        "Chromecast 0b9c8d7e",
+      );
+    },
+  );
+
+  test("falls back to a plain name when the device has no id", () => {
+    expect(receiverNameFor({ friendlyName: "客厅电视" })).toBe("Chromecast");
+  });
+
+  test("is undefined with no device", () => {
+    expect(receiverNameFor(null)).toBeUndefined();
+    expect(receiverNameFor(undefined)).toBeUndefined();
+  });
+
+  test.each([
+    "Living Room TV",
+    "Télé du salon",
+    "リビング\u3000テレビ",
+    "Living\u3000Room",
+    "Гостиная",
+    "\u2003",
+  ])("leaves the receiver a non-empty name it can encode, from %p", (name) => {
+    // What the receiver does with the name before it calls btoa() on it.
+    const kept = toReceiverDeviceName(
+      receiverNameFor({ friendlyName: name, deviceId }) ?? "",
+    );
+
+    expect(kept.trim()).not.toBe("");
+    expect(() => btoa(kept)).not.toThrow();
+  });
+});
+
+describe("toReceiverDeviceName", () => {
+  test("applies the receiver's own cleanup of the Cast device name", () => {
+    expect(toReceiverDeviceName('Salon (TV) — 55"')).toBe("Salon TV  55");
+  });
+});
+
+describe("castToJellyfinReceiver", () => {
+  type Status = {
+    playerState: string;
+    mediaInfo: { customData: { itemId: string; playSessionId: string } };
+  };
+
+  const status = (
+    playerState: string,
+    itemId: string,
+    playSessionId: string,
+  ): Status => ({
+    playerState,
+    mediaInfo: { customData: { itemId, playSessionId } },
+  });
+
+  /** A remote media client whose status updates the test emits. */
+  const makeClient = (current: Status | null = null) => {
+    let listener: ((status: Status | null) => void) | undefined;
+    return {
+      getMediaStatus: jest.fn(async () => current),
+      onMediaStatusUpdated: jest.fn((handler: typeof listener) => {
+        listener = handler;
+        return {
+          remove: () => {
+            listener = undefined;
+          },
+        };
+      }),
+      emit: (next: Status | null) => listener?.(next),
+    };
+  };
+
+  const movie = { Id: "item-1", Name: "Festen", Type: "Movie" as const };
+  const session = () => ({ api: makeApi(), userId: "user-1" });
+  // Lets the media status read and the channel open run before the test acts.
+  const sent = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  const settledWith = async (outcome: Promise<unknown>) => {
+    let result: unknown = "pending";
+    void outcome.then((value) => {
+      result = value;
+    });
+    await sent();
+    return result;
+  };
+
+  test("waits for the receiver to load the item, not for the send", async () => {
+    const client = makeClient();
+    const outcome = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+
+    expect(lastChannel().sendMessage).toHaveBeenCalledTimes(1);
+    expect(await settledWith(outcome)).toBe("pending");
+
+    // The receiver reports the new item idle before it starts loading it.
+    client.emit(status("idle", "item-1", "session-a"));
+    expect(await settledWith(outcome)).toBe("pending");
+
+    client.emit(status("buffering", "item-1", "session-a"));
+    expect(await outcome).toEqual({ status: "loaded" });
+  });
+
+  test("does not take the media being replaced for the new load", async () => {
+    // Recasting the item on the TV (another audio track, say): until the
+    // receiver opens a new play session, the status is the old playback.
+    const client = makeClient(status("playing", "item-1", "session-old"));
+    const outcome = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+
+    client.emit(status("playing", "item-1", "session-old"));
+    client.emit(status("playing", "other-item", "session-b"));
+    expect(await settledWith(outcome)).toBe("pending");
+
+    client.emit(status("playing", "item-1", "session-new"));
+    expect(await outcome).toEqual({ status: "loaded" });
+  });
+
+  test("waits for a live program's channel", async () => {
+    const client = makeClient();
+    const outcome = castToJellyfinReceiver(
+      client as never,
+      session(),
+      {
+        items: [{ Id: "program-1", Type: "Program", ChannelId: "channel-1" }],
+      },
+      1_000,
+    );
+    await sent();
+
+    client.emit(status("buffering", "channel-1", "session-a"));
+    expect(await outcome).toEqual({ status: "loaded" });
+  });
+
+  test("waits for the selected track of a queue", async () => {
+    const client = makeClient();
+    const outcome = castToJellyfinReceiver(
+      client as never,
+      session(),
+      {
+        items: [
+          { Id: "track-1", Type: "Audio" },
+          { Id: "track-2", Type: "Audio" },
+        ],
+        startIndex: 1,
+      },
+      1_000,
+    );
+    await sent();
+
+    client.emit(status("playing", "track-1", "session-a"));
+    expect(await settledWith(outcome)).toBe("pending");
+    client.emit(status("playing", "track-2", "session-b"));
+    expect(await outcome).toEqual({ status: "loaded" });
+  });
+
+  test("reports a load error the receiver sends back", async () => {
+    const client = makeClient();
+    const outcome = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+
+    lastChannel().receive(
+      '{"type":"playbackerror","message":"NoCompatibleStream"}',
+    );
+
+    expect(await outcome).toEqual({
+      status: "failed",
+      error: "playback_failed",
+      message: { type: "playbackerror", message: "NoCompatibleStream" },
+    });
+  });
+
+  test("gives up when the receiver neither loads nor answers", async () => {
+    // What a TV that cannot reach the server does: its first request fails
+    // and it says nothing to the phone.
+    const client = makeClient();
+    const outcome = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [movie] },
+      10,
+    );
+
+    expect(await outcome).toEqual({ status: "timed_out" });
+  });
+
+  /** Holds the next media status read until the test answers it. */
+  const holdMediaStatus = (client: ReturnType<typeof makeClient>) => {
+    let answer = () => {};
+    client.getMediaStatus.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answer = () => resolve(null);
+        }),
+    );
+    return () => answer();
+  };
+
+  test.each([
+    ["the older one", true],
+    ["the newer one", false],
+  ])(
+    "sends only the newer of two casts started together, when %s reads its status first",
+    async (_, olderAnswersFirst) => {
+      // A double tap, or the music auto-cast overlapping a manual cast: both
+      // are still reading the media status when the second one starts.
+      const client = makeClient();
+      const answerFirst = holdMediaStatus(client);
+      const answerSecond = holdMediaStatus(client);
+      const first = castToJellyfinReceiver(
+        client as never,
+        session(),
+        { items: [movie] },
+        1_000,
+      );
+      const second = castToJellyfinReceiver(
+        client as never,
+        session(),
+        { items: [{ Id: "item-2", Type: "Movie" }] },
+        1_000,
+      );
+
+      const [answerEarly, answerLate] = olderAnswersFirst
+        ? [answerFirst, answerSecond]
+        : [answerSecond, answerFirst];
+      answerEarly();
+      await sent();
+      answerLate();
+      await sent();
+
+      expect(await settledWith(first)).toEqual({ status: "superseded" });
+      const playNows = mockCast.channels
+        .flatMap((channel) => channel.sendMessage.mock.calls)
+        .filter(([message]) => message.command === "PlayNow");
+      expect(playNows).toHaveLength(1);
+      expect(playNows[0][0].options.items[0].Id).toBe("item-2");
+
+      client.emit(status("buffering", "item-2", "session-b"));
+      expect(await second).toEqual({ status: "loaded" });
+    },
+  );
+
+  // Auto measuring the bitrate holds a cast's session: a newer cast settles
+  // it at once, and its session failing after that is no failure.
+  test("settles a cast still waiting for its session when a newer one starts", async () => {
+    const client = makeClient();
+    let failSession: (error: Error) => void = () => {};
+    const pending = new Promise<ReturnType<typeof session>>((_, reject) => {
+      failSession = reject;
+    });
+    const first = castToJellyfinReceiver(
+      client as never,
+      pending,
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+    const second = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [{ Id: "item-2", Type: "Movie" }] },
+      1_000,
+    );
+    await sent();
+
+    expect(await settledWith(first)).toEqual({ status: "superseded" });
+    failSession(new Error("The bitrate test answered 503"));
+    await expect(first).resolves.toEqual({ status: "superseded" });
+    client.emit(status("buffering", "item-2", "session-b"));
+    expect(await second).toEqual({ status: "loaded" });
+  });
+
+  test("gives up on a session that never comes", async () => {
+    jest.useFakeTimers();
+    try {
+      const client = makeClient();
+      let result: unknown = "pending";
+      void castToJellyfinReceiver(
+        client as never,
+        new Promise<never>(() => {}),
+        { items: [movie] },
+        1_000,
+      ).then((value) => {
+        result = value;
+      });
+
+      await jest.advanceTimersByTimeAsync(1_000);
+
+      expect(result).toEqual({ status: "timed_out" });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("settles an older cast as replaced when a newer one starts", async () => {
+    const client = makeClient();
+    const first = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+    const second = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [{ Id: "item-2", Type: "Movie" }] },
+      1_000,
+    );
+
+    expect(await first).toEqual({ status: "superseded" });
+    await sent();
+    client.emit(status("buffering", "item-2", "session-b"));
+    expect(await second).toEqual({ status: "loaded" });
+  });
+
+  const playNowBitrate = () =>
+    mockCast.channels
+      .flatMap((channel) => channel.sendMessage.mock.calls)
+      .find(([message]) => message.command === "PlayNow")?.[0].maxBitrate;
+
+  // A music cast named none, and the receiver kept the cap of the video cast
+  // before it for the whole album.
+  test("hands the receiver its ceiling when the cast names no bitrate", async () => {
+    void castToJellyfinReceiver(
+      makeClient() as never,
+      session(),
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+
+    expect(playNowBitrate()).toBe(120_000_000);
+  });
+
+  // Auto in the server's network gives at least 140 Mb/s, more than a
+  // Chromecast takes, which the receiver applies as it is.
+  test("hands the receiver no more than its ceiling", async () => {
+    void castToJellyfinReceiver(
+      makeClient() as never,
+      { ...session(), maxBitrate: 140_000_000 },
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+
+    expect(playNowBitrate()).toBe(120_000_000);
+  });
+
+  test("hands the receiver a lower bitrate as it is", async () => {
+    void castToJellyfinReceiver(
+      makeClient() as never,
+      { ...session(), maxBitrate: 8_000_000 },
+      { items: [movie] },
+      1_000,
+    );
+    await sent();
+
+    expect(playNowBitrate()).toBe(8_000_000);
+  });
+
+  // The session waited on Auto's measure before the cast took its turn: a
+  // cast picked after it, at a fixed quality, loaded first and was replaced.
+  test("takes its turn before its session is ready", async () => {
+    const client = makeClient();
+    let ready: (value: ReturnType<typeof session>) => void = () => {};
+    const first = castToJellyfinReceiver(
+      client as never,
+      new Promise<ReturnType<typeof session>>((resolve) => (ready = resolve)),
+      { items: [movie] },
+      1_000,
+    );
+    const second = castToJellyfinReceiver(
+      client as never,
+      session(),
+      { items: [{ Id: "item-2", Type: "Movie" }] },
+      1_000,
+    );
+    await sent();
+    ready(session());
+    await sent();
+
+    expect(await settledWith(first)).toEqual({ status: "superseded" });
+    const playNows = mockCast.channels
+      .flatMap((channel) => channel.sendMessage.mock.calls)
+      .filter(([message]) => message.command === "PlayNow");
+    expect(playNows.map(([message]) => message.options.items[0].Id)).toEqual([
+      "item-2",
+    ]);
+    client.emit(status("buffering", "item-2", "session-b"));
+    expect(await second).toEqual({ status: "loaded" });
+  });
+
+  test("rejects when the command cannot be sent", async () => {
+    mockCast.connectOnAdd = false;
+
+    await expect(
+      castToJellyfinReceiver(
+        makeClient() as never,
+        session(),
+        { items: [movie] },
+        1_000,
+      ),
+    ).rejects.toThrow("not connected");
+  });
+});

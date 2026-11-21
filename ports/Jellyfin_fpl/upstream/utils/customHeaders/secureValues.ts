@@ -1,0 +1,269 @@
+import * as SecureStore from "expo-secure-store";
+import { atom } from "jotai";
+import { Platform } from "react-native";
+import { store } from "@/utils/store";
+import type { CustomHeader } from "./types";
+
+/**
+ * iOS can launch the app in the background while the phone is locked, and a
+ * header value is read as soon as the first screen renders. An item stored
+ * with the default accessibility, readable only while unlocked, is refused
+ * there, and the read throws. No weaker than this: the values stay unreadable
+ * until the phone has been unlocked once after a restart.
+ *
+ * It only takes on an item being created: saving over an existing one updates
+ * its data and keeps the accessibility it was created with.
+ */
+const WRITE_OPTIONS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK,
+};
+
+/**
+ * The prefix says how an item was created, which SecureStore cannot be asked:
+ * everything under the current one was stored with `WRITE_OPTIONS`, and what
+ * is still under the legacy one was stored by a build from before them.
+ * `recreateLegacySecureValues` moves the second kind over.
+ */
+const CUSTOM_HEADER_VALUE_KEY_PREFIX = "header_value_";
+const LEGACY_VALUE_KEY_PREFIX = "custom_header_value_";
+
+/**
+ * Bumped whenever any header configuration is written. Consumers that build a
+ * long-lived client from the headers (axios instances, image sources) depend on
+ * it so an edit in settings takes effect without a restart.
+ */
+export const customHeadersVersionAtom = atom(0);
+
+export function bumpCustomHeadersVersion(): void {
+  store.set(customHeadersVersionAtom, (version) => version + 1);
+}
+
+/**
+ * URL-safe base64 so a scope can be embedded in a SecureStore key. `btoa` only
+ * accepts Latin-1, so the input is UTF-8 encoded first — a server URL with
+ * non-ASCII characters (an IDN entered in Unicode form) would otherwise throw.
+ */
+function encodeStorageKey(input: string): string {
+  const utf8 = encodeURIComponent(input).replace(/%([0-9A-F]{2})/gi, (_, hex) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  );
+
+  return btoa(utf8).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function customHeaderValueKey(scope: string, index: number): string {
+  return `${CUSTOM_HEADER_VALUE_KEY_PREFIX}${encodeStorageKey(scope)}_${index}`;
+}
+
+/** Guards against one scope reusing (and later deleting) another scope's key. */
+function secureValueKeyScopeMatches(
+  scope: string,
+  secureValueKey: string,
+): boolean {
+  const prefix = [CUSTOM_HEADER_VALUE_KEY_PREFIX, LEGACY_VALUE_KEY_PREFIX].find(
+    (candidate) => secureValueKey.startsWith(candidate),
+  );
+  if (prefix === undefined) return false;
+
+  const encodedScope = encodeStorageKey(scope);
+  const keySuffix = secureValueKey.slice(prefix.length);
+  const separatorIndex = keySuffix.lastIndexOf("_");
+
+  return (
+    separatorIndex > -1 && keySuffix.slice(0, separatorIndex) === encodedScope
+  );
+}
+
+/** Persisted JSON is user-editable state from an older build — validate it. */
+export function isStoredCustomHeader(header: unknown): header is CustomHeader {
+  if (!header || typeof header !== "object") return false;
+  const candidate = header as CustomHeader;
+
+  return (
+    typeof candidate.key === "string" &&
+    typeof candidate.value === "string" &&
+    typeof candidate.enabled === "boolean" &&
+    (typeof candidate.secureValueKey === "string" ||
+      candidate.secureValueKey === undefined) &&
+    (typeof candidate.presetId === "string" || candidate.presetId === undefined)
+  );
+}
+
+/**
+ * SecureStore has no synchronous delete, so a removal is in flight while the
+ * (synchronous) writes below have already landed. Keys are deterministic per
+ * scope, so deleting a scope and immediately re-creating it would let the stale
+ * delete wipe the new value — writing again once it settles keeps the last
+ * write authoritative.
+ */
+const pendingDeletes = new Map<string, Promise<void>>();
+
+function deleteSecureValue(key: string): void {
+  const deletion = SecureStore.deleteItemAsync(key)
+    .catch(() => undefined)
+    .then(() => {
+      if (pendingDeletes.get(key) === deletion) pendingDeletes.delete(key);
+    });
+
+  pendingDeletes.set(key, deletion);
+}
+
+function writeSecureValue(key: string, value: string): void {
+  SecureStore.setItem(key, value, WRITE_OPTIONS);
+
+  const deletion = pendingDeletes.get(key);
+  if (deletion) {
+    void deletion.then(() => {
+      SecureStore.setItem(key, value, WRITE_OPTIONS);
+    });
+  }
+}
+
+function getSecureHeaderValue(header: CustomHeader): string {
+  if (!header.secureValueKey) return header.value;
+  return SecureStore.getItem(header.secureValueKey) ?? "";
+}
+
+/** Fills in the SecureStore-backed values for display or request injection. */
+export function resolveCustomHeaderValues(
+  headers: CustomHeader[],
+): CustomHeader[] {
+  return headers.filter(isStoredCustomHeader).map((header) => ({
+    ...header,
+    value: getSecureHeaderValue(header),
+  }));
+}
+
+/**
+ * Writes each header value to SecureStore and returns the metadata to persist
+ * in MMKV (same shape, empty values). Values belonging to the scope that are no
+ * longer referenced are deleted.
+ *
+ * `headers` must carry real values — pass what the editor holds, never metadata
+ * rows straight out of storage, or the stored values are overwritten with the
+ * empty strings that stand in for them.
+ *
+ * @param scope Namespace for the generated keys, e.g. `server:https://host`.
+ */
+export function secureCustomHeaderMetadata(
+  scope: string,
+  headers: CustomHeader[],
+  previousHeaders: CustomHeader[] = [],
+): CustomHeader[] {
+  const retainedKeys = new Set(
+    headers
+      .map((header) => header.secureValueKey)
+      .filter((key): key is string => Boolean(key)),
+  );
+  const nextKeys = new Set<string>();
+  let nextGeneratedIndex = 0;
+
+  const allocateSecureValueKey = () => {
+    let secureValueKey: string;
+    do {
+      secureValueKey = customHeaderValueKey(scope, nextGeneratedIndex);
+      nextGeneratedIndex += 1;
+    } while (retainedKeys.has(secureValueKey) || nextKeys.has(secureValueKey));
+    return secureValueKey;
+  };
+
+  const canReuseSecureValueKey = (secureValueKey: string) =>
+    secureValueKeyScopeMatches(scope, secureValueKey) &&
+    !nextKeys.has(secureValueKey);
+
+  const metadata = headers.map((header) => {
+    const secureValueKey =
+      header.secureValueKey && canReuseSecureValueKey(header.secureValueKey)
+        ? header.secureValueKey
+        : allocateSecureValueKey();
+    nextKeys.add(secureValueKey);
+    writeSecureValue(secureValueKey, header.value);
+
+    return {
+      key: header.key,
+      value: "",
+      enabled: header.enabled,
+      secureValueKey,
+      presetId: header.presetId,
+    };
+  });
+
+  for (const header of previousHeaders.filter(isStoredCustomHeader)) {
+    if (header.secureValueKey && !nextKeys.has(header.secureValueKey)) {
+      deleteSecureValue(header.secureValueKey);
+    }
+  }
+
+  return metadata;
+}
+
+/** Drops the SecureStore values behind header metadata that is being discarded. */
+export function deleteSecureCustomHeaderValues(headers: CustomHeader[]): void {
+  for (const header of headers.filter(isStoredCustomHeader)) {
+    if (header.secureValueKey) {
+      deleteSecureValue(header.secureValueKey);
+    }
+  }
+}
+
+/**
+ * Stores again, as a new item under a new key, each value of `headers` that a
+ * build from before `WRITE_OPTIONS` stored, so that it can be read on a locked
+ * phone too.
+ *
+ * Returns the rows to persist and the rows they replace, or null when nothing
+ * was moved. The old items are still there: the caller persists the new rows
+ * first and only then drops the replaced ones
+ * (`deleteSecureCustomHeaderValues`), so that at every step a stored row
+ * points at a value that exists.
+ *
+ * A value that cannot be read, on a locked phone for one, or that does not
+ * read back from its new item, keeps its row as it is and is tried again the
+ * next time. A row that was moved no longer has a legacy key, so running this
+ * again does nothing.
+ *
+ * iOS only: the accessibility is the Keychain's, and nowhere else is there a
+ * reason to touch a stored secret.
+ */
+export function recreateLegacySecureValues(
+  scope: string,
+  headers: CustomHeader[],
+): { headers: CustomHeader[]; replaced: CustomHeader[] } | null {
+  if (Platform.OS !== "ios") return null;
+
+  const takenKeys = new Set(
+    headers.filter(isStoredCustomHeader).map((header) => header.secureValueKey),
+  );
+  const replaced: CustomHeader[] = [];
+  let nextIndex = 0;
+
+  const recreated = headers.map((header) => {
+    if (!isStoredCustomHeader(header)) return header;
+    const legacyKey = header.secureValueKey;
+    if (!legacyKey?.startsWith(LEGACY_VALUE_KEY_PREFIX)) return header;
+
+    try {
+      const value = SecureStore.getItem(legacyKey);
+      if (value === null) return header;
+
+      // An item left under this key by a run that was interrupted before the
+      // rows were persisted is one of ours, and is simply written over.
+      let secureValueKey: string;
+      do {
+        secureValueKey = customHeaderValueKey(scope, nextIndex);
+        nextIndex += 1;
+      } while (takenKeys.has(secureValueKey));
+
+      writeSecureValue(secureValueKey, value);
+      if (SecureStore.getItem(secureValueKey) !== value) return header;
+
+      takenKeys.add(secureValueKey);
+      replaced.push(header);
+      return { ...header, secureValueKey };
+    } catch {
+      return header;
+    }
+  });
+
+  return replaced.length > 0 ? { headers: recreated, replaced } : null;
+}

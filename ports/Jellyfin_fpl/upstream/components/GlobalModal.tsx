@@ -1,0 +1,92 @@
+import {
+  BottomSheetBackdrop,
+  type BottomSheetBackdropProps,
+  BottomSheetModal,
+} from "@gorhom/bottom-sheet";
+import { useCallback, useEffect } from "react";
+import { useWindowDimensions } from "react-native";
+import { SHEET_MAX_HEIGHT_RATIO } from "@/constants/Values";
+import { useGlobalModal } from "@/providers/GlobalModalProvider";
+
+/**
+ * GlobalModal Component
+ *
+ * This component renders a global bottom sheet modal that can be controlled
+ * from anywhere in the app using the useGlobalModal hook.
+ *
+ * Place this component at the root level of your app (in _layout.tsx)
+ * after BottomSheetModalProvider.
+ */
+export const GlobalModal = () => {
+  const { hideModal, modalState, modalRef, isVisible } = useGlobalModal();
+  // Derived here rather than passed in by callers: this component re-renders on
+  // rotation, so a sheet that is already open follows the new window height.
+  const { height: windowHeight } = useWindowDimensions();
+  const maxDynamicContentSize = windowHeight * SHEET_MAX_HEIGHT_RATIO;
+
+  useEffect(() => {
+    if (isVisible && modalState.content) {
+      modalRef.current?.present();
+    }
+  }, [isVisible, modalState.content, modalRef]);
+
+  const handleSheetChanges = useCallback(
+    (index: number) => {
+      if (index === -1) {
+        hideModal();
+      }
+    },
+    [hideModal],
+  );
+
+  const renderBackdrop = useCallback(
+    (props: BottomSheetBackdropProps) => (
+      <BottomSheetBackdrop
+        {...props}
+        disappearsOnIndex={-1}
+        appearsOnIndex={0}
+      />
+    ),
+    [],
+  );
+
+  const defaultOptions = {
+    enableDynamicSizing: true,
+    enablePanDownToClose: true,
+    enableContentPanningGesture: true,
+    backgroundStyle: {
+      backgroundColor: "#171717",
+    },
+    handleIndicatorStyle: {
+      backgroundColor: "white",
+    },
+  };
+
+  // Merge default options with provided options
+  const modalOptions = { ...defaultOptions, ...modalState.options };
+
+  return (
+    <BottomSheetModal
+      ref={modalRef}
+      enableDynamicSizing={modalOptions.enableDynamicSizing}
+      maxDynamicContentSize={maxDynamicContentSize}
+      onChange={handleSheetChanges}
+      backdropComponent={renderBackdrop}
+      handleIndicatorStyle={modalOptions.handleIndicatorStyle}
+      backgroundStyle={modalOptions.backgroundStyle}
+      enablePanDownToClose={modalOptions.enablePanDownToClose}
+      enableContentPanningGesture={modalOptions.enableContentPanningGesture}
+      enableDismissOnClose
+      // Left at gorhom's defaults on purpose. `adjustResize` only means
+      // something when the window actually resizes for the keyboard, and this
+      // app draws edge to edge, so it never does — setting it drove the sheet
+      // down behind the keyboard instead. Sheets with inputs scroll their own
+      // content out of the way (see CustomHeaderSheet).
+      keyboardBlurBehavior='restore'
+      stackBehavior='push'
+      style={{ zIndex: 1000 }}
+    >
+      {modalState.content}
+    </BottomSheetModal>
+  );
+};

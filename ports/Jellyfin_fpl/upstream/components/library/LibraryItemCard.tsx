@@ -1,0 +1,239 @@
+import { Ionicons } from "@expo/vector-icons";
+import type {
+  BaseItemDto,
+  BaseItemKind,
+  CollectionType,
+} from "@jellyfin/sdk/lib/generated-client/models";
+import { getLibraryApi, getLiveTvApi } from "@jellyfin/sdk/lib/utils/api";
+import { useQuery } from "@tanstack/react-query";
+import { useAtom } from "jotai";
+import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { type TouchableOpacityProps, View } from "react-native";
+import { Image } from "@/components/common/ServerImage";
+import { Text } from "@/components/common/Text";
+import useRouter from "@/hooks/useAppRouter";
+import { apiAtom, userAtom } from "@/providers/JellyfinProvider";
+import { useSettings } from "@/utils/atoms/settings";
+import { getPrimaryImageUrl } from "@/utils/jellyfin/image/getPrimaryImageUrl";
+import { folderHref, opensAsFolders } from "@/utils/library/folders";
+import { TouchableItemRouter } from "../common/TouchableItemRouter";
+
+interface Props extends TouchableOpacityProps {
+  library: BaseItemDto;
+}
+
+type IconName = React.ComponentProps<typeof Ionicons>["name"];
+
+const icons: Record<CollectionType, IconName> = {
+  movies: "film",
+  tvshows: "tv",
+  music: "musical-notes",
+  books: "book",
+  homevideos: "videocam",
+  boxsets: "albums",
+  playlists: "list",
+  folders: "folder",
+  livetv: "tv",
+  musicvideos: "musical-notes",
+  photos: "images",
+  trailers: "videocam",
+  unknown: "help-circle",
+} as const;
+export const LibraryItemCard: React.FC<Props> = ({ library, ...props }) => {
+  const [api] = useAtom(apiAtom);
+  const [user] = useAtom(userAtom);
+  const { settings } = useSettings();
+  const router = useRouter();
+
+  const { t } = useTranslation();
+
+  const url = useMemo(
+    () =>
+      getPrimaryImageUrl({
+        api,
+        item: library,
+      }),
+    [api, library],
+  );
+
+  const itemType = useMemo(() => {
+    let _itemType: BaseItemKind | undefined;
+
+    if (library.CollectionType === "movies") {
+      _itemType = "Movie";
+    } else if (library.CollectionType === "tvshows") {
+      _itemType = "Series";
+    } else if (library.CollectionType === "boxsets") {
+      _itemType = "BoxSet";
+    } else if (library.CollectionType === "homevideos") {
+      _itemType = "Video";
+    } else if (library.CollectionType === "musicvideos") {
+      _itemType = "MusicVideo";
+    }
+
+    return _itemType;
+  }, [library.CollectionType]);
+
+  const itemTypeName = useMemo(() => {
+    let nameStr: string;
+
+    if (library.CollectionType === "movies") {
+      nameStr = t("library.item_types.movies");
+    } else if (library.CollectionType === "tvshows") {
+      nameStr = t("library.item_types.series");
+    } else if (library.CollectionType === "boxsets") {
+      nameStr = t("library.item_types.boxsets");
+    } else if (library.CollectionType === "livetv") {
+      nameStr = t("live_tv.tabs.channels");
+    } else {
+      nameStr = t("library.item_types.items");
+    }
+
+    return nameStr;
+  }, [library.CollectionType]);
+
+  const { data: itemsCount } = useQuery({
+    queryKey: ["library-count", library.Id],
+    queryFn: async () => {
+      if (!api) return null;
+      // Channels aren't children of the Live TV view, so getItems counts 0.
+      // Jellyfin 12 treats limit 0 as no limit, so ask for one channel.
+      if (library.CollectionType === "livetv") {
+        const response = await getLiveTvApi(api).getLiveTvChannels({
+          userId: user?.Id,
+          limit: 1,
+          addCurrentProgram: false,
+        });
+        return response.data.TotalRecordCount;
+      }
+      const response = await getLibraryApi(api).getItems({
+        userId: user?.Id,
+        parentId: library.Id,
+        recursive: true,
+        limit: 0,
+        includeItemTypes: itemType ? [itemType] : undefined,
+      });
+      return response.data.TotalRecordCount;
+    },
+    // The card can mount before the api is restored.
+    enabled: !!api,
+  });
+
+  if (!url) return null;
+
+  const folderNavigation = opensAsFolders(library)
+    ? {
+        onPress: () =>
+          router.push(
+            folderHref(
+              library,
+              false,
+              library.CollectionType === "music" ? "music" : "library",
+            ),
+          ),
+      }
+    : undefined;
+
+  if (settings?.libraryOptions?.display === "row") {
+    return (
+      <TouchableItemRouter
+        item={library}
+        className='w-full px-4'
+        {...folderNavigation}
+      >
+        <View className='flex flex-row items-center w-full relative '>
+          <Ionicons
+            name={icons[library.CollectionType!] || "folder"}
+            size={22}
+            color={"#e5e5e5"}
+          />
+          <Text className='text-start px-4 text-neutral-200'>
+            {library.Name}
+          </Text>
+          {settings?.libraryOptions?.showStats && (
+            <Text className='font-bold text-xs text-neutral-500 text-start ml-auto'>
+              {itemsCount} {itemTypeName}
+            </Text>
+          )}
+        </View>
+      </TouchableItemRouter>
+    );
+  }
+
+  if (settings?.libraryOptions?.imageStyle === "cover") {
+    return (
+      <TouchableItemRouter
+        item={library}
+        className='w-full'
+        {...folderNavigation}
+      >
+        <View className='flex justify-center rounded-xl w-full relative border border-neutral-900 h-20 '>
+          <View
+            style={{
+              width: "100%",
+              height: "100%",
+              borderRadius: 8,
+              position: "absolute",
+              top: 0,
+              left: 0,
+              overflow: "hidden",
+            }}
+          >
+            <Image
+              source={{ uri: url }}
+              style={{
+                width: "100%",
+                height: "100%",
+              }}
+              cachePolicy={"memory-disk"}
+            />
+            <View
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                backgroundColor: "rgba(0, 0, 0, 0.3)", // Adjust the alpha value (0.3) to control darkness
+              }}
+            />
+          </View>
+          {settings?.libraryOptions?.showTitles && (
+            <Text className='font-bold text-lg text-start px-4'>
+              {library.Name}
+            </Text>
+          )}
+          {settings?.libraryOptions?.showStats && (
+            <Text className='font-bold text-xs  text-start px-4'>
+              {itemsCount} {itemTypeName}
+            </Text>
+          )}
+        </View>
+      </TouchableItemRouter>
+    );
+  }
+
+  return (
+    <TouchableItemRouter item={library} {...folderNavigation} {...props}>
+      <View className='flex flex-row items-center justify-between rounded-xl w-full relative border bg-neutral-900 border-neutral-900 h-20'>
+        <View className='flex flex-col'>
+          <Text className='font-bold text-lg text-start px-4'>
+            {library.Name}
+          </Text>
+          {settings?.libraryOptions?.showStats && (
+            <Text className='font-bold text-xs text-neutral-500 text-start px-4'>
+              {itemsCount} {itemTypeName}
+            </Text>
+          )}
+        </View>
+        <View className='p-2'>
+          <Image
+            source={{ uri: url }}
+            className='h-full aspect-[2/1] object-cover rounded-lg overflow-hidden'
+          />
+        </View>
+      </View>
+    </TouchableItemRouter>
+  );
+};

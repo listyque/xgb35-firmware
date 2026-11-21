@@ -1,0 +1,56 @@
+--- a/src/render/raster.zig
++++ b/src/render/raster.zig
+@@ -84,7 +84,9 @@
+         return self.regions[0..n];
+     }
+ 
+-    const Tri = struct {
++    pub var hardware_draw: ?*const fn (*Canvas, []const Tri) usize = null;
++
++    pub const Tri = struct {
+         p: [3][3]f32,
+         uv: [3][2]f32,
+         tex: ?Image,
+@@ -172,7 +174,8 @@
+         if (self.rec_gpa == null) return;
+         self.rec_gpa = null;
+         defer self.recorded.clearRetainingCapacity();
+-        const tris = self.recorded.items;
++        var tris: []const Tri = self.recorded.items;
++        if (hardware_draw) |draw| tris = tris[draw(self,tris)..];
+         if (tris.len == 0) return;
+         var job: Job = .{ .canvas = self, .tris = tris, .chunks = (self.img.height + chunk - 1) / chunk };
+         if (pool) |p| p.run(&job) else job.run();
+--- a/src/render/layer.zig
++++ b/src/render/layer.zig
+@@ -61,6 +61,7 @@
+ 
+ /// Actor layer for a `w×h` window with top-left `origin` (background pixels).
+ pub const Layer = struct {
++    pub var hardware_shadow: ?*const fn ([]u8, usize, []const [3][2]f32) bool = null;
+     canvas: raster.Canvas,
+     /// Model textures (the host's; none: untextured).
+     textures: ?*Textures = null,
+@@ -294,8 +295,11 @@
+             self.shadow_stat = .{};
+             return;
+         }
+-        var fill: MaskJob = .{ .layer = self };
+-        if (pool) |p| p.run(&fill) else fill.run();
++        const on_gpu = if (hardware_shadow) |draw_mask| draw_mask(self.shadow, mask_size, self.shadow_tris.items) else false;
++        if (!on_gpu) {
++            var fill: MaskJob = .{ .layer = self };
++            if (pool) |p| p.run(&fill) else fill.run();
++        }
+         self.shadow_tris = .empty;
+         const n = mask_size;
+         const tn = n / 2;
+--- a/src/viewer/main.zig
++++ b/src/viewer/main.zig
+@@ -22,5 +22,6 @@
+ }
+ 
+ fn mainLinux(minimal: std.process.Init.Minimal) !void {
++    if (@hasDecl(@import("build_options"), "xgb35_sgx")) @import("xgb35_scene").install();
+     return @import("linux310_io").runWithMinimal(minimal, run.run);
+ }

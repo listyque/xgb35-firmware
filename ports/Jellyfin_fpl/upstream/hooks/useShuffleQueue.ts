@@ -1,0 +1,105 @@
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models";
+import { useSetAtom } from "jotai";
+import { useCallback, useRef } from "react";
+import { usePlayMedia } from "@/hooks/usePlayMedia";
+import { useServerVersion } from "@/hooks/useServerVersion";
+import { useSettings } from "@/utils/atoms/settings";
+import { shuffleQueueAtom } from "@/utils/atoms/shuffleQueue";
+import { toBitrateRequest } from "@/utils/bitrate";
+import {
+  getAdjacentStartTicks,
+  getDefaultPlaySettings,
+} from "@/utils/jellyfin/getDefaultPlaySettings";
+import { shuffle } from "@/utils/shuffle";
+
+/**
+ * The entries a queue can play: a missing or unaired episode is listed by the
+ * server as a "Virtual" placeholder, with no media file behind it.
+ */
+export const playableQueueItems = (candidates: BaseItemDto[]): BaseItemDto[] =>
+  candidates.filter((item) => item.Id && item.LocationType !== "Virtual");
+
+interface StartQueueOptions {
+  isOffline?: boolean;
+}
+
+/**
+ * Shared, platform-agnostic control for the play queue.
+ *
+ * `startQueue` stores the items in the order given and immediately starts
+ * playing the first entry. Once the queue is set, `usePlaybackManager` walks
+ * it for next/previous instead of the sequential adjacent-episode order.
+ * `startShuffle` does the same in a random order.
+ *
+ * `clearShuffleQueue` tears the queue down; it is called from the normal
+ * (non-queue) play paths so a stale queue can't hijack a later playback.
+ */
+export const useShuffleQueue = () => {
+  const playMedia = usePlayMedia();
+  const { settings } = useSettings();
+  const setShuffleQueue = useSetAtom(shuffleQueueAtom);
+  // Decides where a matched alternate version starts, see
+  // getAdjacentStartTicks. Whatever is cached will do: a server does not go
+  // back a major version.
+  const serverVersion = useServerVersion({
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  // usePlayMedia hands out a new function on every render, and these
+  // callbacks end up in header options set from an effect: reading the latest
+  // through a ref keeps them stable, so the header is not rebuilt per render.
+  const latest = useRef({ playMedia, settings, serverVersion });
+  latest.current = { playMedia, settings, serverVersion };
+
+  const clearShuffleQueue = useCallback(() => {
+    setShuffleQueue(null);
+  }, [setShuffleQueue]);
+
+  /** Returns false when nothing in `candidates` can be played. */
+  const startQueue = useCallback(
+    (candidates: BaseItemDto[], options: StartQueueOptions = {}): boolean => {
+      const items = playableQueueItems(candidates);
+      if (items.length === 0) return false;
+
+      setShuffleQueue({ items });
+
+      const { playMedia, settings, serverVersion } = latest.current;
+      const first = items[0];
+      const { mediaSource, audioIndex, subtitleIndex, bitrate } =
+        getDefaultPlaySettings(first, settings);
+
+      // The queue was just set — the chooser must not clear it.
+      void playMedia(
+        {
+          itemId: first.Id ?? "",
+          audioIndex,
+          subtitleIndex,
+          mediaSourceId: mediaSource?.Id ?? undefined,
+          bitrateValue: toBitrateRequest(bitrate),
+          offline: options.isOffline ?? false,
+          playbackPositionTicks:
+            getAdjacentStartTicks(
+              first,
+              mediaSource,
+              !!options.isOffline,
+              serverVersion,
+            ) ?? 0,
+        },
+        {
+          preserveShuffleQueue: true,
+          item: first,
+          queueItemIds: items.map((item) => item.Id!),
+        },
+      );
+      return true;
+    },
+    [setShuffleQueue],
+  );
+
+  const startShuffle = useCallback(
+    (episodes: BaseItemDto[], options: StartQueueOptions = {}) =>
+      startQueue(shuffle(episodes), options),
+    [startQueue],
+  );
+
+  return { startQueue, startShuffle, clearShuffleQueue };
+};

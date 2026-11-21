@@ -1,0 +1,399 @@
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models";
+import { useAtom } from "jotai";
+import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { Platform, ScrollView, TextInput, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Text } from "@/components/common/Text";
+import { TVDiscover } from "@/components/seerr/discover/TVDiscover";
+import { TV_SKELETON } from "@/constants/Colors";
+import { useScaledTVSizes } from "@/constants/TVSizes";
+import { useScaledTVTypography } from "@/constants/TVTypography";
+import { TvSearchView } from "@/modules/tv-search";
+import { apiAtom } from "@/providers/JellyfinProvider";
+import { getPrimaryImageUrl } from "@/utils/jellyfin/image/getPrimaryImageUrl";
+import { scaleSize } from "@/utils/scaleSize";
+import type {
+  DiscoverSlider,
+  MovieResult,
+  PersonResult,
+  TvResult,
+} from "@/utils/seerr/types";
+import { TVSearchSection } from "./TVSearchSection";
+import {
+  type TVSearchSortButtons,
+  TVSearchTabBadges,
+} from "./TVSearchTabBadges";
+import { TVSeerrSearchResults } from "./TVSeerrSearchResults";
+
+const TOP_PADDING = 100;
+// Height of the native search bar itself. The tvOS grid keyboard presents as
+// its own overlay when the field is focused, so we only reserve the bar height
+// here — not the whole keyboard. Tunable once seen on device.
+const SEARCH_AREA_HEIGHT = 250;
+const SECTION_GAP = 10;
+const SCALE_PADDING = 20;
+
+// Loading skeleton for TV.
+// Mirrors TVSearchSection's scaled layout (poster width, item gap, edge
+// padding, heading typography, poster radius) so the placeholder lines up with
+// the real content that replaces it.
+const TVLoadingSkeleton: React.FC = () => {
+  const typography = useScaledTVTypography();
+  const sizes = useScaledTVSizes();
+  const itemWidth = sizes.posters.poster;
+  return (
+    <View style={{ overflow: "visible" }}>
+      {/* Section header placeholder — matches the heading typography + margins */}
+      <View
+        style={{
+          width: itemWidth,
+          height: typography.heading,
+          backgroundColor: TV_SKELETON,
+          borderRadius: 8,
+          marginBottom: 20,
+          marginLeft: sizes.padding.horizontal,
+        }}
+      />
+      <View
+        style={{
+          flexDirection: "row",
+          gap: sizes.gaps.item,
+          paddingLeft: sizes.padding.horizontal,
+          paddingVertical: SCALE_PADDING,
+        }}
+      >
+        {[1, 2, 3, 4, 5].map((i) => (
+          <View key={i} style={{ width: itemWidth }}>
+            <View
+              style={{
+                backgroundColor: TV_SKELETON,
+                width: itemWidth,
+                aspectRatio: 10 / 15,
+                borderRadius: scaleSize(24),
+                marginBottom: scaleSize(8),
+              }}
+            />
+            <View
+              style={{
+                borderRadius: 6,
+                overflow: "hidden",
+                alignSelf: "flex-start",
+              }}
+            >
+              <Text
+                style={{
+                  color: TV_SKELETON,
+                  backgroundColor: TV_SKELETON,
+                  borderRadius: 6,
+                  fontSize: typography.callout,
+                }}
+                numberOfLines={1}
+              >
+                Placeholder text here
+              </Text>
+            </View>
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+};
+
+type SearchType = "Library" | "Discover";
+
+interface TVSearchPageProps {
+  search: string;
+  setSearch: (text: string) => void;
+  debouncedSearch: string;
+  // Library search results
+  movies?: BaseItemDto[];
+  series?: BaseItemDto[];
+  episodes?: BaseItemDto[];
+  collections?: BaseItemDto[];
+  actors?: BaseItemDto[];
+  studios?: BaseItemDto[];
+  artists?: BaseItemDto[];
+  albums?: BaseItemDto[];
+  songs?: BaseItemDto[];
+  playlists?: BaseItemDto[];
+  loading: boolean;
+  noResults: boolean;
+  onItemPress: (item: BaseItemDto) => void;
+  onItemLongPress?: (item: BaseItemDto) => void;
+  // Seerr/Discover props
+  searchType: SearchType;
+  setSearchType: (type: SearchType) => void;
+  showDiscover: boolean;
+  /** The sort of the results, given once something is typed. */
+  sortButtons?: TVSearchSortButtons;
+  seerrMovies?: MovieResult[];
+  seerrTv?: TvResult[];
+  seerrPersons?: PersonResult[];
+  seerrLoading?: boolean;
+  seerrNoResults?: boolean;
+  onSeerrMoviePress?: (item: MovieResult) => void;
+  onSeerrTvPress?: (item: TvResult) => void;
+  onSeerrPersonPress?: (item: PersonResult) => void;
+  // Discover sliders for empty state
+  discoverSliders?: DiscoverSlider[];
+}
+
+export const TVSearchPage: React.FC<TVSearchPageProps> = ({
+  setSearch,
+  debouncedSearch,
+  movies,
+  series,
+  episodes,
+  collections,
+  actors,
+  studios,
+  artists,
+  albums,
+  songs,
+  playlists,
+  loading,
+  noResults,
+  onItemPress,
+  onItemLongPress,
+  searchType,
+  setSearchType,
+  showDiscover,
+  sortButtons,
+  seerrMovies = [],
+  seerrTv = [],
+  seerrPersons = [],
+  seerrLoading = false,
+  seerrNoResults = false,
+  onSeerrMoviePress,
+  onSeerrTvPress,
+  onSeerrPersonPress,
+  discoverSliders,
+}) => {
+  const typography = useScaledTVTypography();
+  const sizes = useScaledTVSizes();
+  const { t } = useTranslation();
+  const insets = useSafeAreaInsets();
+  const [api] = useAtom(apiAtom);
+
+  // Image URL getter for music items
+  const getImageUrl = useMemo(() => {
+    return (item: BaseItemDto): string | undefined => {
+      if (!api) return undefined;
+      const url = getPrimaryImageUrl({ api, item });
+      return url ?? undefined;
+    };
+  }, [api]);
+
+  // Determine which section should have initial focus
+  const sections = useMemo(() => {
+    const allSections: {
+      key: string;
+      title: string;
+      items: BaseItemDto[] | undefined;
+      orientation?: "horizontal" | "vertical";
+    }[] = [
+      { key: "movies", title: t("search.movies"), items: movies },
+      { key: "series", title: t("search.series"), items: series },
+      {
+        key: "episodes",
+        title: t("search.episodes"),
+        items: episodes,
+        orientation: "horizontal" as const,
+      },
+      {
+        key: "collections",
+        title: t("search.collections"),
+        items: collections,
+      },
+      { key: "actors", title: t("search.actors"), items: actors },
+      {
+        key: "studios",
+        title: t("search.studios"),
+        items: studios,
+        orientation: "horizontal" as const,
+      },
+      { key: "artists", title: t("search.artists"), items: artists },
+      { key: "albums", title: t("search.albums"), items: albums },
+      { key: "songs", title: t("search.songs"), items: songs },
+      { key: "playlists", title: t("search.playlists"), items: playlists },
+    ];
+
+    return allSections.filter((s) => s.items && s.items.length > 0);
+  }, [
+    movies,
+    series,
+    episodes,
+    collections,
+    actors,
+    studios,
+    artists,
+    albums,
+    songs,
+    playlists,
+    t,
+  ]);
+
+  const isLibraryMode = searchType === "Library";
+  const isDiscoverMode = searchType === "Discover";
+  const currentLoading = isLibraryMode ? loading : seerrLoading;
+  const currentNoResults = isLibraryMode ? noResults : seerrNoResults;
+
+  return (
+    <View style={{ flex: 1 }}>
+      {/* Sticky header: search field stays pinned while results scroll below. */}
+      <View
+        style={{
+          paddingTop: insets.top + TOP_PADDING,
+        }}
+      >
+        {/* Search bar: native tvOS SwiftUI `.searchable` on Apple TV, standard
+            TextInput fallback on Android TV (the native module is Apple-only). */}
+        {Platform.OS === "ios" ? (
+          <View
+            style={{
+              marginBottom: 24,
+              height: SEARCH_AREA_HEIGHT,
+            }}
+          >
+            {/* No horizontal margin here: the native tvOS search bar centers
+                itself and renders a trailing "Hold to Dictate" hint. */}
+            <TvSearchView
+              style={{ width: "100%", height: "100%" }}
+              placeholder={t("search.search")}
+              onChangeText={(e) => setSearch(e.nativeEvent.text)}
+            />
+          </View>
+        ) : (
+          <View
+            style={{
+              marginHorizontal: sizes.padding.horizontal,
+              marginBottom: 24,
+            }}
+          >
+            <TextInput
+              style={{
+                minHeight: 56,
+                width: "100%",
+                backgroundColor: "#262626",
+                borderRadius: 12,
+                paddingHorizontal: 20,
+                fontSize: typography.body,
+                color: "#fff",
+              }}
+              placeholder={t("search.search")}
+              placeholderTextColor='rgba(255,255,255,0.4)'
+              onChangeText={setSearch}
+              defaultValue=''
+              autoFocus={false}
+            />
+          </View>
+        )}
+      </View>
+
+      <ScrollView
+        nestedScrollEnabled
+        showsVerticalScrollIndicator={false}
+        keyboardDismissMode='on-drag'
+        contentContainerStyle={{
+          paddingBottom: insets.bottom + 60,
+        }}
+      >
+        {/* Search type tabs, and the sort of the results */}
+        {(showDiscover || sortButtons) && (
+          <View style={{ marginHorizontal: sizes.padding.horizontal }}>
+            <TVSearchTabBadges
+              searchType={searchType}
+              setSearchType={setSearchType}
+              showDiscover={showDiscover}
+              sortButtons={sortButtons}
+            />
+          </View>
+        )}
+
+        {/* Loading State */}
+        {currentLoading && (
+          <View style={{ gap: SECTION_GAP }}>
+            <TVLoadingSkeleton />
+            <TVLoadingSkeleton />
+          </View>
+        )}
+
+        {/* Library Search Results */}
+        {isLibraryMode && !loading && (
+          <View style={{ gap: SECTION_GAP }}>
+            {sections.map((section) => (
+              <TVSearchSection
+                key={section.key}
+                title={section.title}
+                items={section.items!}
+                orientation={section.orientation || "vertical"}
+                // Never auto-focus a result. The native search field owns focus
+                // while typing; `hasTVPreferredFocus` here would re-grab focus on
+                // every keystroke as results re-render. User navigates down to the
+                // grid manually.
+                isFirstSection={false}
+                onItemPress={onItemPress}
+                // The long press marks an item played, which a studio is not.
+                onItemLongPress={
+                  section.key === "studios" ? undefined : onItemLongPress
+                }
+                imageUrlGetter={
+                  ["artists", "albums", "songs", "playlists"].includes(
+                    section.key,
+                  )
+                    ? getImageUrl
+                    : undefined
+                }
+              />
+            ))}
+          </View>
+        )}
+
+        {/* Seerr/Discover Search Results */}
+        {isDiscoverMode && !seerrLoading && debouncedSearch.length > 0 && (
+          <TVSeerrSearchResults
+            movieResults={seerrMovies}
+            tvResults={seerrTv}
+            personResults={seerrPersons}
+            loading={seerrLoading}
+            noResults={seerrNoResults}
+            searchQuery={debouncedSearch}
+            onMoviePress={onSeerrMoviePress || (() => {})}
+            onTvPress={onSeerrTvPress || (() => {})}
+            onPersonPress={onSeerrPersonPress || (() => {})}
+          />
+        )}
+
+        {/* Discover Content (when no search query in Discover mode) */}
+        {isDiscoverMode && !seerrLoading && debouncedSearch.length === 0 && (
+          <TVDiscover sliders={discoverSliders} />
+        )}
+
+        {/* No Results State */}
+        {!currentLoading && currentNoResults && debouncedSearch.length > 0 && (
+          <View style={{ alignItems: "center", paddingTop: 40 }}>
+            <Text
+              style={{
+                fontSize: typography.heading,
+                fontWeight: "bold",
+                color: "#FFFFFF",
+                marginBottom: 8,
+              }}
+            >
+              {t("search.no_results_found_for")}
+            </Text>
+            <Text
+              style={{
+                fontSize: typography.body,
+                color: "rgba(255,255,255,0.6)",
+              }}
+            >
+              "{debouncedSearch}"
+            </Text>
+          </View>
+        )}
+      </ScrollView>
+    </View>
+  );
+};

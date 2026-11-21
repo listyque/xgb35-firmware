@@ -1,0 +1,13 @@
+{
+  "event": "data_abort",
+  "r0": "0xc072418c",
+  "r2": "0x0",
+  "pc": "0xc0063d38",
+  "dfar": "0x0",
+  "dfsr": "0x5",
+  "ifsr": "0x1002",
+  "r1": "0x0",
+  "lr": "0xc0063d0c",
+  "headless": true,
+  "rom_return": true
+}

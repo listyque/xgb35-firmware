@@ -1,0 +1,77 @@
+{
+  "entry": 3020354816,
+  "report_ddr": 32505856,
+  "report_sram": 3020343040,
+  "nonce": 595897527,
+  "service_bytes": 16848,
+  "diagnostic_callback": true,
+  "retained_native_regions": [
+    [
+      8960,
+      20252
+    ],
+    [
+      24112,
+      25120
+    ],
+    [
+      21336,
+      21344
+    ],
+    [
+      22076,
+      23444
+    ],
+    [
+      23996,
+      24112
+    ]
+  ],
+  "service_disabled_DDR_range": [
+    6208,
+    10344
+  ],
+  "nand_flashable": false,
+  "stage0_status": "NAND reader and physical ECC layout pending",
+  "host_continuations": 0,
+  "probe_ddr": false,
+  "stop_entry": false,
+  "segments": [
+    {
+      "address": 3020326912,
+      "file": "parameters.bin",
+      "bytes": 1024,
+      "sha256": "a4769b75a0bf8e470e95c58fc246cb018bcef5dc67aeae80ca1c3c5e9354b58a"
+    },
+    {
+      "address": 3020328960,
+      "file": "ddr-init.bin",
+      "bytes": 14044,
+      "sha256": "333d09430ef64fc1ea97ea3112b1377b5f935a7973f9a30980fad3bc218aedbb"
+    },
+    {
+      "address": 3020343296,
+      "file": "usb-packed.bin",
+      "bytes": 10403,
+      "sha256": "9a2599a9ce990a5543a620b899d491f3ec130531cf4c63f76df51d015f2c98b8"
+    },
+    {
+      "address": 3020354816,
+      "file": "start.bin",
+      "bytes": 732,
+      "sha256": "3b582eb2799976bd29a9cae9e038967d960cfa4ffe275eb08bbbb24d3da2f572"
+    }
+  ],
+  "payload": {
+    "file": "sram-payload.bin",
+    "load_address": 3020326912,
+    "bytes": 28672,
+    "sha256": "ada91f08260bff0adfbd7dadbf4bc9295d0d288ad04ca18d9139fe8a02fbcaae",
+    "boot_entry_offset": 27904,
+    "stage0_must_clear_guard_at": 3020343280
+  },
+  "reserved_rom_stack": [
+    3020355584,
+    3020357632
+  ]
+}

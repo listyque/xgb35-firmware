@@ -12,9 +12,12 @@
 | --- | --- |
 | [Железо и фотографии](docs/hardware.ru.md) | Плата, NAND, память, экран, питание, загрузка, USB и диагностические интерфейсы |
 | [Штатная прошивка](firmware/stock/README.ru.md) | Пакет восстановления Actions PATO из разделов NAND со сборкой от 22 августа 2023 года |
+| [Восстановление «кирпича» через ADFU](recovery/adfu/README.ru.md) | Драйвер Windows, резервная копия NAND, диагностика из RAM и восстановление блока 0 |
+| [Сборки Linux](firmware/linux/README.md) | Загрузка из RAM, мультибут с microSD, Alpine Desktop, OnionOS и SuperX |
 | [Мультибут XGB35](multiboot/README.ru.md) | Предварительная версия установщика для Windows. Готовит microSD из локальных файлов сборки |
 | [Порт SuperX CFW](docs/superx-port.ru.md) | Совместимость и изменения, необходимые для запуска на XGB35 |
 | [Статус прошивок](docs/firmware.ru.md) | Собственная CFW XGB35, мультибут и SuperX |
+| [Порты и авторы](ports/README.md) | Приложения, игры и оболочки для XGB35 |
 
 ## SuperX CFW от Powkiddy
 

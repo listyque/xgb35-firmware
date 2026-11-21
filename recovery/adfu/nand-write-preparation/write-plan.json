@@ -1,0 +1,207 @@
+{
+  "status": "PREPARATION_ONLY_NO_FLASH_COMMANDS",
+  "NAND_written_or_erased": false,
+  "logical_candidate_sha256": "2a95894f0d51f0002fad4945f6f7c34a24f6158a32f91069c41eb8d3e97f7333",
+  "chip_marking": "Micron 29F64G08CBABA WP:B (board photograph)",
+  "recorded_NAND_ID": "2c64444ba9000000",
+  "datasheet": {
+    "url": "https://datasheet.lcsc.com/lcsc/1908271118_Micron-Tech-MT29F64G08CBABAWP-B_C410865.pdf",
+    "revision": "E 11/11; advance copy",
+    "pages": [
+      1,
+      99,
+      117,
+      118,
+      119,
+      136
+    ]
+  },
+  "geometry": {
+    "page_data": 8192,
+    "page_OOB": 744,
+    "pages_per_erase_block": 256,
+    "erase_block_raw_bytes": 2287616,
+    "erase_block_data_bytes": 2097152
+  },
+  "target": {
+    "erase_blocks": [
+      0
+    ],
+    "physical_rows": [
+      0,
+      255
+    ],
+    "logical_replacement_rows": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "program_page_order": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      8,
+      9,
+      12,
+      13,
+      16,
+      17,
+      20,
+      21,
+      24,
+      25,
+      28,
+      29,
+      32,
+      33,
+      36,
+      37,
+      40,
+      41,
+      44,
+      45,
+      48,
+      49,
+      52,
+      53,
+      56,
+      57,
+      60,
+      61,
+      64,
+      65,
+      68,
+      69,
+      72,
+      73,
+      76,
+      77,
+      80,
+      81,
+      84,
+      85,
+      88,
+      89,
+      92,
+      93,
+      96,
+      97,
+      100,
+      101,
+      104,
+      105,
+      108,
+      109,
+      112,
+      113
+    ],
+    "all_FF_pages_left_unprogrammed": 196,
+    "image": "block0-candidate-REVIEW-ONLY.bin"
+  },
+  "preserve": {
+    "blocks": [
+      1
+    ],
+    "rows": [
+      256,
+      511
+    ],
+    "all_blocks_from": 2,
+    "copy_is_not_automatic_failover_after_valid_header": true
+  },
+  "boot_search_checks": [
+    {
+      "row": 0,
+      "block": 0,
+      "valid_boot_sector": true
+    },
+    {
+      "row": 32,
+      "block": 0,
+      "valid_boot_sector": false
+    },
+    {
+      "row": 64,
+      "block": 0,
+      "valid_boot_sector": false
+    },
+    {
+      "row": 128,
+      "block": 0,
+      "valid_boot_sector": false
+    },
+    {
+      "row": 192,
+      "block": 0,
+      "valid_boot_sector": false
+    },
+    {
+      "row": 256,
+      "block": 1,
+      "valid_boot_sector": true
+    },
+    {
+      "row": 384,
+      "block": 1,
+      "valid_boot_sector": false
+    }
+  ],
+  "backup_validation": {
+    "independent_raw_captures": 4,
+    "fresh_complete_raw_captures": 2,
+    "raw_pages_per_fresh_capture": 512,
+    "hardware_ECC_sectors": 960,
+    "corrected_bits_vs_first_fresh_capture": 41,
+    "block_decoded_copies_equal": true,
+    "block_corrected_raw_copies_equal": false
+  },
+  "unprotected_OOB_policy": "first fresh capture preserved verbatim; disagreements logged, no correction claimed",
+  "artifacts": {
+    "block0-original-raw.bin": {
+      "bytes": 2287616,
+      "sha256": "bbbed1c404a6c2039edd2417acfe7d4f5752b448849c7344a957184583ffb398"
+    },
+    "block1-keep-original-raw.bin": {
+      "bytes": 2287616,
+      "sha256": "6666a3888b7b5e6efe9e6b8fd0f43b0a2e832c2cf2e1eb9cab588335eca3af4d"
+    },
+    "block0-restore-ECC-corrected.bin": {
+      "bytes": 2287616,
+      "sha256": "b56ae94664dfe844b7522f125ec6990ee06d3d4e26f469e0eab8d04720a6c0d5"
+    },
+    "block1-keep-ECC-corrected.bin": {
+      "bytes": 2287616,
+      "sha256": "fd319df2126266d6f4210ff1ca4d281807bb9e573b37f978b896042d8d6e430b"
+    },
+    "block0-original-decoded.bin": {
+      "bytes": 2097152,
+      "sha256": "a666ae41a0b6dae0b1943df317e714e42076cec1f993c16ae915fa55b9a520a8"
+    },
+    "block1-original-decoded.bin": {
+      "bytes": 2097152,
+      "sha256": "a666ae41a0b6dae0b1943df317e714e42076cec1f993c16ae915fa55b9a520a8"
+    },
+    "block0-candidate-REVIEW-ONLY.bin": {
+      "bytes": 2287616,
+      "sha256": "da927b6853cd2ba6ef9d661b01e2967d5f6ea317c665b7b790a320cd0cba70d0"
+    }
+  },
+  "rollback": {
+    "target_block": 0,
+    "preferred_image": "block0-restore-ECC-corrected.bin",
+    "forensic_image": "block0-original-raw.bin",
+    "block1_must_remain_untouched": true,
+    "restores": "pre-experiment NAND boot content, not a proven working SYSTEM firmware"
+  },
+  "write_ready": false,
+  "remaining": [
+    "review and validate the actual NAND PROGRAM/ERASE implementation",
+    "copy this recovery archive to an independent storage device",
+    "fresh ID/bad-block/backup preflight immediately before any separately authorized write",
+    "power-on boot of the new physical NAND image has not been tested"
+  ]
+}

@@ -1,0 +1,48 @@
+#!/bin/sh
+# ST7796S init over 3-wire 9-bit SPI (bit-banged GPIO), copied from the update U-Boot
+# panel-glp-st7796s.c (uboot.bin 0x0201e244). Pins from kernel.dtb panel@glp:
+# sda = gpioa19 -> 19, clk = gpioa18 -> 18, cs = gpioc28 -> 92, power = gpiob6 -> 38.
+G=/sys/class/gpio
+for n in 18 19 92; do
+    [ -d $G/gpio$n ] || echo $n > $G/export || exit 1
+    echo out > $G/gpio$n/direction || exit 1
+done
+SDA=$G/gpio19/value CLK=$G/gpio18/value CS=$G/gpio92/value
+echo 1 > $CS; echo 0 > $CLK; echo 0 > $SDA
+
+byte() {  # $1 = D/C bit, $2 = byte; data is latched on the rising clock edge
+    echo 0 > $CS
+    v=$(( ($1 << 8) | $2 )); m=256
+    while [ $m -gt 0 ]; do
+        echo 0 > $CLK
+        if [ $((v & m)) -ne 0 ]; then echo 1 > $SDA; else echo 0 > $SDA; fi
+        echo 1 > $CLK
+        m=$((m >> 1))
+    done
+    echo 1 > $CS
+}
+cmd() { c=$1; shift; byte 0 $((c)); for d; do byte 1 $((d)); done; }
+
+cmd 0x11; usleep 150000
+cmd 0x36 0x0C
+cmd 0x3A 0x55
+cmd 0xF0 0xC3
+cmd 0xF0 0x96
+cmd 0xB4 0x01
+cmd 0xB6 0xA0 0x02 0x3B
+cmd 0xB7 0xC6
+cmd 0xC0 0x80 0x75
+cmd 0xC1 0x0B
+cmd 0xC2 0xA7
+cmd 0xC5 0x09
+cmd 0xE8 0x40 0x8A 0x1B 0x1B 0x20 0x13 0x1D 0x33
+cmd 0xE0 0xF0 0x05 0x05 0x02 0x03 0x05 0x32 0x43 0x4D 0x3B 0x1B 0x1B 0x30 0x34
+cmd 0xE1 0x6E 0x12 0x18 0x11 0x0F 0x16 0x33 0x33 0x46 0x35 0x0F 0x0E 0x29 0x2E
+cmd 0xF0 0xC3
+cmd 0xF0 0x96
+usleep 120000
+cmd 0x21
+cmd 0x29
+usleep 60000
+cmd 0x2C
+echo st7796s init done

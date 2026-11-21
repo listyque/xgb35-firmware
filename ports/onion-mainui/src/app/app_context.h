@@ -1,0 +1,208 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+#ifndef MAINUI_APP_CONTEXT_H
+#define MAINUI_APP_CONTEXT_H
+#include "app/catalog_job.h"
+#include "app/console_position.h"
+#include "app/details.h"
+#include "app/device_job.h"
+#include "app/settings_page.h"
+#include "catalog/favorite_edit.h"
+#include "core/letter_jump.h"
+#include "menus/console_view.h"
+#include "menus/game_menu.h"
+#include "ui/list_video.h"
+#include "ui/menu_view.h"
+#include "ui/name_input.h"
+
+typedef struct MainUIPreviewList MainUIPreviewList;
+
+/* Adapts three owned list models to the same incremental navigation code. */
+typedef struct {
+    MainUICatalog *catalog;
+    MainUILibrary *library;
+    MainUIPreviewList *preview;
+} MainUIListLabels;
+
+/* UI-thread state. Allocate once with calloc: workers and borrowed views need
+ * stable addresses. Startup opens the resources; teardown closes them.
+ * catalog aliases games or expert; library may alias search.results. Option
+ * strings borrow argv or the path buffers below. launch_source borrows the
+ * current models and viewports and is rebuilt before each key dispatch. */
+typedef struct {
+    MainUITheme theme;
+    MainUIDetails details;
+    MainUICatalogJob catalog_job;
+    MainUIDeviceJob device_job;
+    MainUIAboutJob about_job;
+    MainUILanguages languages;
+    MainUIPreview preview;
+    bool preview_sync_once;     /* Include selected artwork in the first list frame. */
+    MainUIListVideo list_video; /* the selected game's video in place of its cover */
+    bool carousel_offscreen;    /* completed prefetch changed no visible icon */
+    bool presented_video;       /* the last full frame showed a video frame */
+
+    const char *dir;
+    const char *base;
+    const char *config_dir;
+    const char *list_path;
+    const char *snapshot;
+    const char *handoff_dir;
+    const char *device_directory;
+    const char *sd;
+    const char *system_name;
+    const char *input_script;
+    const char *input_text;
+    bool real_device;
+    /* Keymon answers a Select release in MainUI with a Menu press and
+     * release; that release must not open the context menu again. */
+    bool select_menu_pending;
+    Uint32 select_menu_until;
+    /* L2 or R2 went down while Select was held and Start was not. */
+    bool select_brightness;
+    /* Y, Select and Start act when released, as in stock, so a keymon
+     * shortcut on Y has killed MainUI before it acts: whether the press is
+     * still to act. A keymon combo (another button while Select or Start
+     * is down) cancels Select and Start. */
+    bool y_armed, select_armed, start_armed;
+    /* X with a Favorite or Game List Options shortcut on a game acts when
+     * released too: whether the press is still to act. */
+    bool x_armed;
+    /* The release of a scripted Y, Select or Start tap, still to send. */
+    SDLKey script_release;
+    /* Keymon's L1 after its Menu release: the Menu releases already matched
+     * or passed over, and whether that L1 is down now. */
+    int menu_events_seen;
+    bool quiet_l1_armed, quiet_l1_held;
+    bool battery_override, battery_charging;
+    bool start_systems;
+    bool refresh_caches;
+    bool informational;
+    unsigned snapshot_elapsed;
+    int battery_percent;
+    MainUIDeviceAdapter device_adapter;
+    MainUIDeviceStatus device_status;
+    Uint32 next_device_check, next_wifi_scan, next_battery_check;
+    bool device_enabled;
+    char resolved_theme[MAINUI_PATH_MAX];
+    char fallback_path[MAINUI_PATH_MAX];
+    char settings_path[MAINUI_PATH_MAX];
+    char default_config[MAINUI_PATH_MAX];
+    bool handheld_input;
+    MainUIConfig config;
+    MainUIPreviewList *list;
+    MainUICatalog *catalog;
+    SDL_Surface *display;
+    SDL_Surface *screen;
+    MainUIViewport view;
+    bool home;
+    bool settings_open;
+    bool language_open;
+    MainUIContext context;
+    MainUIContext home_context;
+    MainUIGameMenu game_menu;          /* game-menu.json, read once at startup */
+    MainUIConsoleView console_view;    /* console-view.json, read once at startup */
+    Uint32 carousel_last_direction_at; /* Last accepted Carousel Left/Right movement. */
+    bool carousel_direction_paced;     /* Timestamp valid, including tick zero. */
+    int carousel_pending_direction;    /* At most one deferred Left (-1) or Right (+1). */
+    bool carousel_pending_tap;         /* A released tap survives; held repeats do not. */
+    bool labels_consoles;              /* the cached row labels are the console page's */
+    /* The listed consoles' counter: the selected one's games, -1 for no cache. */
+    const MainUICatalog *console_games_catalog;
+    int console_games_index;
+    long long console_games;
+    cJSON *context_record;
+    bool context_open;
+    int confirmation;
+    bool return_latched; /* A pressed for a confirmation or message is still held */
+    MainUIStockSettings settings;
+    MainUISettingsPage settings_page;
+    int settings_keyboard;
+    MainUISearch search;
+    uint64_t catalog_generation;
+    bool search_confirm_held;
+    /* Recovering a list page that cannot be read: 0 none, then the step
+     * taken last: 1 reloaded, 2 rebuilt the cache, 3 switched to scanning. */
+    int page_recovery;
+    bool system_damage_reported; /* the damaged-system.json message was shown */
+    int timer_interval;
+    bool timer_failure_logged;
+    bool search_keyboard;
+    bool media_keyboard; /* the keyboard searches Game Info's walkthrough */
+    /* Left in a game list reset a scrolling title: the next Left on the same
+     * game opens Saved Games. Any other key ends it. */
+    bool saves_left_armed;
+    bool wifi_was_visible;
+    /* A connection was made to wifi_join_ssid: if it is not joined by
+     * wifi_join_until, the Wi-Fi page says so, until it is. Joined counts
+     * only once the status was refreshed after the connection (fresh): the
+     * one saved before can still name that network. */
+    bool wifi_join_watch, wifi_join_failed, wifi_join_fresh;
+    char wifi_join_ssid[33];
+    Uint32 wifi_join_until;
+    MainUICatalog *apps;
+    MainUICatalog *games;
+    MainUICatalog *expert;
+    MainUIViewport games_view;
+    MainUIViewport expert_view;
+    MainUIViewport apps_view;
+    /* The console last selected in Games and Expert, saved whenever it
+     * changes. Until a section is opened, or a returned session or Search
+     * picks its console, opening it selects the remembered one (pending). */
+    MainUIConsolePosition console_position;
+    bool console_position_pending[MAINUI_POSITION_SECTIONS];
+    MainUIViewport saved_library_views[2];
+    char message_title[256];
+    char message_body[256];
+    /* The message last written to the log, so each is logged once. */
+    char logged_message[520];
+    MainUILibrary *library;
+    MainUILibrary *favorites;
+    bool favorite_rows[20];
+    MainUIFavoriteEditor favorite_editor;
+    MainUINameInput name_input;
+    MainUIContextAction name_action;
+    MainUIViewport systems_view;
+    MainUIMenu menu;
+    MainUIViewport home_view;
+    MainUIMenuView menu_view;
+    SDL_Surface *labels[20];
+    /* The row's title reads right to left: it is shown and scrolled from its
+     * right end, where it begins. Set with labels. */
+    bool label_rtl[20];
+    SDL_Surface *highlighted[20];
+    int cached_start;
+    int status;
+    SDL_Color heading_color;
+    SDL_Surface *heading;
+    SDL_TimerID timer;
+    /* Idle repaint skipping: what the last presented frame showed, and when. */
+    bool idle_tick;
+    bool video_wake; /* woken by a list or gallery video's frame */
+    /* Marquee pacing: next frame deadline, and frames shown since scrolling began
+     * for the selection made at marquee_origin. */
+    bool marquee_paced;
+    Uint32 marquee_due, marquee_origin, marquee_steps;
+    bool presented_animating;
+    /* The last full frame drew the Games or Expert console grid. */
+    bool systems_drawn;
+    Uint32 active_at, presented_at;
+    Uint32 last_screen_present_at; /* Every present, including partial video/row updates. */
+    bool carousel_frame_pending;   /* A change waiting for the next carousel frame deadline. */
+    int presented_battery, presented_battery_mv, presented_wifi_signal;
+    bool presented_charging;
+    bool presented_wifi_online, presented_hotspot;
+    char presented_wifi_address[64];
+    Uint32 selected_at;
+    char selected_identity[MAINUI_PATH_MAX * 3];
+    int sound_selection;
+    int sound_section;
+    bool running;
+    bool launch_pending;
+    MainUILetterJump letter_jump;
+    bool held[SDLK_LAST];
+    MainUIViewport settings_view;
+    MainUILaunchSource launch_source;
+    bool about_visible, animate, draw_frame;
+    MainUIListLabels list_labels;
+} MainUIApp;
+#endif

@@ -1,0 +1,18 @@
+{
+  "uImage": {
+    "bytes": 2673536,
+    "sha256": "655ac99b3648ae19c515355406cc379c254e6413befc439811a00d9920f46e42"
+  },
+  "ramdisk.img": {
+    "bytes": 3631760,
+    "sha256": "1744b71a9fa70224de6c5e6c06c9a943cc9f77cc2c86fa450996e1913a417a6c"
+  },
+  "kernel.dtb": {
+    "bytes": 27174,
+    "sha256": "f817b447be5f72e9e1b0c2f26c5bd5e1531f9b47653a1264a272ef0b96cc8b3c"
+  },
+  "uenv.txt": {
+    "bytes": 74,
+    "sha256": "4620ba9db5b1e70f47f2cfec2109e96394baba0866e2eccab4ffb9a52a246c4e"
+  }
+}

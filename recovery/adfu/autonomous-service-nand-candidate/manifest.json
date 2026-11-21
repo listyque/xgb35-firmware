@@ -1,0 +1,49 @@
+{
+  "status": "UNTESTED_NAND_READER_NOT_FLASHABLE",
+  "logical_bytes": 32768,
+  "logical_image_sha256": "2a95894f0d51f0002fad4945f6f7c34a24f6158a32f91069c41eb8d3e97f7333",
+  "tested_ram_manifest_sha256": "63552bc963dbdb614a2b0b520ca8d4d8d99d30e87961faf2618fe1b17926c3d7",
+  "boot_sector": "unchanged factory MBREC first sector",
+  "payload_offset": 4096,
+  "reader_execution_address": 3020325376,
+  "nand_operations": [
+    "BootROM dispatch operation 4: read only"
+  ],
+  "required_page_data_bytes": 8192,
+  "required_ECC_step_bytes": 1024,
+  "not_validated": [
+    "physical ECC/OOB and scrambling layout",
+    "reader execution on device",
+    "CPU/interrupt state inherited from NAND boot",
+    "power-on boot and recovery fallback"
+  ],
+  "ram_result": {
+    "cold_ddr_pll": 10,
+    "host_execution_commands": 1,
+    "manifest_sha256": "63552bc963dbdb614a2b0b520ca8d4d8d99d30e87961faf2618fe1b17926c3d7",
+    "checks": [
+      {
+        "stage": "single_handoff_accepted"
+      },
+      {
+        "stage": "autonomous_DDR_and_USB",
+        "init_report": "315455410300000000000000000000008cff07001fce1ac4ceefd224458180450a0300000000000002000000fcf67e1b6b0844c062369121be7712ab371bfcb4",
+        "calibration_parameter_changes": [
+          42,
+          43,
+          45
+        ],
+        "new_host_process": true
+      },
+      {
+        "rounds": 64,
+        "bytes_per_round": 4096,
+        "seconds": 0.686
+      },
+      {
+        "idle_checks": 10,
+        "USB_responds": true
+      }
+    ]
+  }
+}

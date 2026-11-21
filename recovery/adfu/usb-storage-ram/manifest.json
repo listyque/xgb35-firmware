@@ -1,0 +1,17 @@
+{
+  "Image": {
+    "address": 16777216,
+    "bytes": 7454656,
+    "sha256": "81b0afc324d6396aad30fa3a2393dd1298679fa6a579bfbf94c07bf3c932d114"
+  },
+  "initramfs.cpio.gz": {
+    "address": 25165824,
+    "bytes": 1190237,
+    "sha256": "a441ca96033582469958ee49225088423f111e839bffc33c4a206b6e5df0ee9b"
+  },
+  "kernel.dtb": {
+    "address": 31457280,
+    "bytes": 26674,
+    "sha256": "ce702f68df888cea7b6f5b091e5ee240ec49b671d331e45ba80a4af01c81b4fb"
+  }
+}

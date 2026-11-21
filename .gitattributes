@@ -1,0 +1,5 @@
+multiboot/sgx-init.sh text eol=lf
+drivers/sgx540/* text eol=lf
+/firmware/linux/alpine-desktop-rootfs.tar.gz filter=lfs diff=lfs merge=lfs -text
+/firmware/linux/superx-xgb35-sd.tar.gz filter=lfs diff=lfs merge=lfs -text
+/firmware/stock/2024-05-19-reference/update.zip filter=lfs diff=lfs merge=lfs -text

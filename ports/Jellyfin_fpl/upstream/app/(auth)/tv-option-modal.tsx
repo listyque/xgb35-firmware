@@ -1,0 +1,283 @@
+import { BlurView } from "expo-blur";
+import { useAtomValue } from "jotai";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Animated,
+  Easing,
+  FlatList,
+  ScrollView,
+  StyleSheet,
+  TVFocusGuideView,
+  type ViewInstance,
+} from "react-native";
+import { Text } from "@/components/common/Text";
+import { TVOptionCard } from "@/components/tv";
+import { TVSheetTiming } from "@/constants/TVSheet";
+import { useScaledTVTypography } from "@/constants/TVTypography";
+import useRouter from "@/hooks/useAppRouter";
+import { useTVBackPress } from "@/hooks/useTVBackPress";
+import { tvOptionModalAtom } from "@/utils/atoms/tvOptionModal";
+import { deferToMicrotask } from "@/utils/deferToMicrotask";
+import { requestTVFocus } from "@/utils/requestTVFocus";
+import { scaleSize } from "@/utils/scaleSize";
+import { store } from "@/utils/store";
+import { createSubmission } from "@/utils/submission";
+
+/**
+ * Above this many options the card strip virtualizes; below it, it doesn't.
+ *
+ * Set well clear of the app-language list (28 entries) so only the Jellyfin
+ * culture lists (~200) take the windowed path — adding a translation should not
+ * silently change how an unrelated sheet mounts.
+ */
+const VIRTUALIZE_ABOVE = 60;
+
+// Spec: hooks/useTVOptionModal.test.tsx. It cannot sit next to this file,
+// Expo Router turns everything under app/ into a route.
+export default function TVOptionModal() {
+  const router = useRouter();
+  const modalState = useAtomValue(tvOptionModalAtom);
+  const typography = useScaledTVTypography();
+
+  const [isReady, setIsReady] = useState(false);
+  const firstCardRef = useRef<ViewInstance>(null);
+
+  const overlayOpacity = useRef(new Animated.Value(0)).current;
+  const sheetTranslateY = useRef(new Animated.Value(200)).current;
+  // Android TV can deliver one remote select twice in the same JS batch
+  // (react-native-tvos#110/#138, see useAppRouter): the sheet closes once, or
+  // the second router.back() pops the screen under it as well.
+  const submission = useRef(createSubmission()).current;
+
+  const initialSelectedIndex = useMemo(() => {
+    if (!modalState?.options) return 0;
+    const idx = modalState.options.findIndex((o) => o.selected);
+    return Math.max(idx, 0);
+  }, [modalState?.options]);
+
+  // Animate in on mount and cleanup atom on unmount
+  useEffect(() => {
+    submission.show();
+    overlayOpacity.setValue(0);
+    sheetTranslateY.setValue(200);
+
+    Animated.parallel([
+      Animated.timing(overlayOpacity, {
+        toValue: 1,
+        duration: TVSheetTiming.fadeInMs,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: true,
+      }),
+      Animated.timing(sheetTranslateY, {
+        toValue: 0,
+        duration: TVSheetTiming.slideInMs,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+
+    // Delay focus setup to allow layout
+    const timer = setTimeout(
+      () => setIsReady(true),
+      TVSheetTiming.contentDelayMs,
+    );
+    return () => {
+      clearTimeout(timer);
+      submission.dismiss();
+      // Clear the atom on unmount to prevent stale callbacks from being retained
+      store.set(tvOptionModalAtom, null);
+    };
+  }, [overlayOpacity, sheetTranslateY, submission]);
+
+  // Request focus on the first card when ready
+  useEffect(() => {
+    if (isReady && firstCardRef.current) {
+      const timer = setTimeout(() => {
+        requestTVFocus(firstCardRef.current);
+      }, TVSheetTiming.focusDelayMs);
+      return () => clearTimeout(timer);
+    }
+  }, [isReady]);
+
+  const handleSelect = (value: any) => {
+    if (!modalState || !submission.dismiss()) return;
+    if (modalState.deferApplyUntilDismissed) {
+      // onSelect navigates (the transcode audio switch replacing the player);
+      // a router.replace fired while this modal is the active route would be
+      // swallowed. Close FIRST, apply after dismissal.
+      const { onSelect } = modalState;
+      store.set(tvOptionModalAtom, null);
+      router.back();
+      deferToMicrotask(() => onSelect(value));
+      return;
+    }
+    // State-only callers (detail page, library filters, settings): run before
+    // closing so the re-render happens while the modal is up. Deferring it until
+    // after dismissal re-renders the page after focus returns and yanks TV
+    // focus, leaving navigation stuck. The guard is spent already, so the
+    // sheet closes even when the choice throws.
+    try {
+      modalState.onSelect(value);
+    } finally {
+      store.set(tvOptionModalAtom, null);
+      router.back();
+    }
+  };
+
+  const handleClose = useCallback(() => {
+    if (!submission.dismiss()) return;
+    store.set(tvOptionModalAtom, null);
+    router.back();
+  }, [router, submission]);
+
+  // Intercept back/menu press to close the modal instead of the player
+  useTVBackPress(() => {
+    handleClose();
+    return true;
+  }, [handleClose]);
+
+  // If no modal state, just go back (shouldn't happen in normal usage)
+  if (!modalState) {
+    return null;
+  }
+
+  const { title, options } = modalState;
+  const scaledCardWidth = scaleSize(160);
+  const scaledCardHeight = scaleSize(75);
+  const cardGap = scaleSize(12);
+  // Every sheet is the same card strip. Past a few dozen options the plain
+  // ScrollView becomes the problem — it mounts a Pressable and a focus
+  // animation per option, and the language pickers carry the whole Jellyfin
+  // culture list — so those render through a virtualized list instead. Same
+  // cards, same layout; only the mounting strategy differs.
+  const shouldVirtualize = options.length > VIRTUALIZE_ABOVE;
+
+  return (
+    <Animated.View style={[styles.overlay, { opacity: overlayOpacity }]}>
+      <Animated.View
+        style={[
+          styles.sheetContainer,
+          { transform: [{ translateY: sheetTranslateY }] },
+        ]}
+      >
+        <BlurView intensity={80} tint='dark' style={styles.blurContainer}>
+          <TVFocusGuideView
+            autoFocus
+            trapFocusUp
+            trapFocusDown
+            trapFocusLeft
+            trapFocusRight
+            style={styles.content}
+          >
+            <Text style={[styles.title, { fontSize: typography.callout }]}>
+              {title}
+            </Text>
+            {isReady &&
+              (shouldVirtualize ? (
+                <FlatList
+                  horizontal
+                  data={options}
+                  style={styles.scrollView}
+                  contentContainerStyle={styles.scrollContent}
+                  keyExtractor={(_, index) => String(index)}
+                  showsHorizontalScrollIndicator={false}
+                  initialScrollIndex={initialSelectedIndex}
+                  // Fixed card metrics, so this is exact rather than estimated —
+                  // and initialScrollIndex needs it to open on the current pick.
+                  getItemLayout={(_, index) => ({
+                    length: scaledCardWidth + cardGap,
+                    offset: (scaledCardWidth + cardGap) * index,
+                    index,
+                  })}
+                  // Render a generous buffer either side of the viewport: TV
+                  // focus moves card by card, and focus landing on a card the
+                  // windowing has not mounted yet drops it to the overlay.
+                  initialNumToRender={24}
+                  windowSize={11}
+                  removeClippedSubviews={false}
+                  renderItem={({ item, index }) => (
+                    <TVOptionCard
+                      ref={
+                        index === initialSelectedIndex
+                          ? firstCardRef
+                          : undefined
+                      }
+                      label={item.label}
+                      sublabel={item.sublabel}
+                      selected={item.selected}
+                      hasTVPreferredFocus={index === initialSelectedIndex}
+                      onPress={() => handleSelect(item.value)}
+                      width={scaledCardWidth}
+                      height={scaledCardHeight}
+                    />
+                  )}
+                />
+              ) : (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  style={styles.scrollView}
+                  contentContainerStyle={styles.scrollContent}
+                >
+                  {options.map((option, index) => (
+                    <TVOptionCard
+                      key={index}
+                      ref={
+                        index === initialSelectedIndex
+                          ? firstCardRef
+                          : undefined
+                      }
+                      label={option.label}
+                      sublabel={option.sublabel}
+                      selected={option.selected}
+                      hasTVPreferredFocus={index === initialSelectedIndex}
+                      onPress={() => handleSelect(option.value)}
+                      width={scaledCardWidth}
+                      height={scaledCardHeight}
+                    />
+                  ))}
+                </ScrollView>
+              ))}
+          </TVFocusGuideView>
+        </BlurView>
+      </Animated.View>
+    </Animated.View>
+  );
+}
+
+const styles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+    justifyContent: "flex-end",
+  },
+  sheetContainer: {
+    width: "100%",
+  },
+  blurContainer: {
+    borderTopLeftRadius: scaleSize(24),
+    borderTopRightRadius: scaleSize(24),
+    overflow: "hidden",
+  },
+  content: {
+    paddingTop: scaleSize(24),
+    paddingBottom: scaleSize(50),
+    overflow: "visible",
+  },
+  title: {
+    fontWeight: "500",
+    color: "rgba(255,255,255,0.6)",
+    marginBottom: scaleSize(16),
+    paddingHorizontal: scaleSize(48),
+    textTransform: "uppercase",
+    letterSpacing: 1,
+  },
+  scrollView: {
+    overflow: "visible",
+  },
+  scrollContent: {
+    paddingHorizontal: scaleSize(48),
+    paddingVertical: scaleSize(20),
+    gap: scaleSize(12),
+  },
+});

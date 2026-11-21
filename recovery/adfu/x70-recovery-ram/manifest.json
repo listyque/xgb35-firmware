@@ -1,0 +1,24 @@
+{
+  "source": "x70/recovery.img from firmware-x70-2023-reference.zip",
+  "kernel_container_sha256": "dc6cfe8ac24a8e31bde732f43dc7616e30cdc19e81acc1f2faaf53bb753bd263",
+  "original_initramfs_sha256": "15bab18ae834c8a611912bc7a02fb510d93d5667dce9d6dda3e8857821812da8",
+  "original_dtb_sha256": "b516e6f2e047742b5aed56567d471936e4b2fa2d1b796efb6f3df9b0fd124255",
+  "files": {
+    "zImage": "dd4f1efbbdf124bbb3e711b347ebe89cfcce094d2981bde61b637d27ec0dbca4",
+    "ram-initramfs.cpio.gz": "cc41fe0f24365510e352a19c2306ca9d8e96cb8df5b2d8d80f6597c85722c2e6",
+    "ram-kernel.dtb": "c267f818501f9c2c57fdd0587b6b747eaf1399adc1f0bfc42f1834906302e0f4"
+  },
+  "physical_addresses": {
+    "zImage": 16777216,
+    "ram-initramfs.cpio.gz": 25165824,
+    "ram-kernel.dtb": 31457280
+  },
+  "ram_limit": 33554432,
+  "disabled_dt_storage_nodes": [
+    "/mmc@b0340000",
+    "/mmc@b0344000",
+    "/mmc@b0348000",
+    "/nand@b0320000"
+  ],
+  "boot_marker": "X70-RECOVERY-RAM-INIT-OK"
+}

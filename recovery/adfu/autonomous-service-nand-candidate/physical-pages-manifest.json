@@ -1,0 +1,43 @@
+{
+  "status": "OFFLINE_PAGE_CANDIDATES_FULL_BOOT_UNTESTED",
+  "flash_ready": false,
+  "logical_sha256": "2a95894f0d51f0002fad4945f6f7c34a24f6158a32f91069c41eb8d3e97f7333",
+  "physical_page_bytes": 8936,
+  "data_bytes_per_page": 8192,
+  "OOB_bytes_per_page": 744,
+  "scope": "Only four pages for each known boot row; not erase-block or full-NAND images",
+  "metadata": "preserved all factory 4-byte records and unused OOB bytes",
+  "whitening": "row/step-specific mask recovered from factory data and verified against live reads",
+  "hardware_evidence": {
+    "raw_pages": 8,
+    "decoded_sectors": 64,
+    "candidate_28_sector_loop": "passed for boot rows 0 and 256, redirected to DDR",
+    "bad_checksum_branch": "passed, redirected to RAM return stub",
+    "one_bit_correction": "row 259, sector 2: decoded matches factory, ECC register 1",
+    "RAM_chain_validation": "ram-chain-validation.json"
+  },
+  "images": [
+    {
+      "file": "UNFLASHED-physical-rows-0-3.bin",
+      "first_row": 0,
+      "page_count": 4,
+      "bytes": 35744,
+      "sha256": "32b5358ae9853c4b83ee05b119d87b3b112d54166bec00c251be6085190b391f"
+    },
+    {
+      "file": "UNFLASHED-physical-rows-256-259.bin",
+      "first_row": 256,
+      "page_count": 4,
+      "bytes": 35744,
+      "sha256": "3ea3d89e7d8cdbff03e9bd22bc00e0383a86c6c85cacca72db00c3bb91b322c8"
+    }
+  ],
+  "not_checked": [
+    "actual NAND PROGRAM/ERASE implementation and physical rollback",
+    "power-on BootROM NAND search and physical loading of the new image",
+    "independent storage copy of the recovery archive",
+    "recovery from arbitrary CPU hangs (no watchdog test)"
+  ],
+  "NAND_writes_performed": false,
+  "write_preparation": "../nand-write-preparation/write-plan.json"
+}

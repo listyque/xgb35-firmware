@@ -12,9 +12,12 @@ The **XGB35** is a handheld game console based on the Actions Semiconductor **AT
 | --- | --- |
 | [Hardware and photos](docs/hardware.md) | Board, NAND, memory, display, power, boot, USB and debug interfaces |
 | [Stock firmware](firmware/stock/README.md) | Actions PATO recovery package rebuilt from the August 2023 NAND components |
+| [ADFU brick recovery](recovery/adfu/README.md) | Windows driver, raw NAND backup, RAM diagnostics and block 0 restoration |
+| [Linux builds](firmware/linux/README.md) | RAM boot, microSD multiboot, Alpine Desktop, OnionOS and SuperX |
 | [XGB35 Multiboot](multiboot/README.md) | Windows installer preview for provisioning a microSD card from local build artifacts |
 | [SuperX CFW port](docs/superx-port.md) | Compatibility findings and required changes for XGB35 |
 | [Firmware status](docs/firmware.md) | XGB35 CFW, multiboot and SuperX status |
+| [Ports and upstream credits](ports/README.md) | Application, game and frontend ports for XGB35 |
 
 ## SuperX CFW for Powkiddy
 

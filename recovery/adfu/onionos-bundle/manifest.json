@@ -1,0 +1,14 @@
+{
+  "mainui_elf": {
+    "bytes": 841324,
+    "sha256": "8ee8a0bfcc372f37f384a3dc50455f77aa51a5f46803cc230bf98ec6e5e7b6e9"
+  },
+  "unit_tests_elf": {
+    "bytes": 835388,
+    "sha256": "56e8277ec4220f2a9e55225afa8d67ae99da3a70a24a6d25762c61c2b732343b"
+  },
+  "sd_bundle_tar_gz": {
+    "bytes": 11492773,
+    "sha256": "f9b84cd4e0ebae750bd585833bf9e14f1ff5d20547dea72ec1d09d3a8b301d77"
+  }
+}

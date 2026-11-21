@@ -1,0 +1,663 @@
+import { Ionicons } from "@expo/vector-icons";
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models";
+import {
+  getLibraryApi,
+  getShowApi,
+  getSuggestionApi,
+  getUserViewApi,
+} from "@jellyfin/sdk/lib/utils/api";
+import { type QueryFunction, useQuery } from "@tanstack/react-query";
+import { useSegments } from "expo-router";
+import { useAtomValue } from "jotai";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import {
+  ActivityIndicator,
+  Platform,
+  RefreshControl,
+  ScrollView,
+  type ScrollViewInstance,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Button } from "@/components/Button";
+import { Text } from "@/components/common/Text";
+import { HomeFolders } from "@/components/home/HomeFolders";
+import { HomeHeroCarousel } from "@/components/home/HomeHeroCarousel";
+import { InfiniteScrollingCollectionList } from "@/components/home/InfiniteScrollingCollectionList";
+import { StreamystatsPromotedWatchlists } from "@/components/home/StreamystatsPromotedWatchlists";
+import { StreamystatsRecommendations } from "@/components/home/StreamystatsRecommendations";
+import { Loader } from "@/components/Loader";
+import { MediaListSection } from "@/components/medialists/MediaListSection";
+import { UPCOMING_HOME_PAGE_SIZE } from "@/constants/Upcoming";
+import useRouter from "@/hooks/useAppRouter";
+import { useNetworkStatus } from "@/hooks/useNetworkStatus";
+import { useRefreshLibraryOnFocus } from "@/hooks/useRefreshLibraryOnFocus";
+import { useRemapHiddenLibraries } from "@/hooks/useRemapHiddenLibraries";
+import { useInvalidatePlaybackProgressCache } from "@/hooks/useRevalidatePlaybackProgressCache";
+import { fetchUpcomingEpisodes } from "@/hooks/useUpcomingEpisodes";
+import { useDownload } from "@/providers/DownloadProvider";
+import { useIntroSheet } from "@/providers/IntroSheetProvider";
+import {
+  apiAtom,
+  pendingAccountSaveAtom,
+  userAtom,
+} from "@/providers/JellyfinProvider";
+import { useSettings } from "@/utils/atoms/settings";
+import { fetchCustomHomeSection } from "@/utils/customHomeSection";
+import { eventBus } from "@/utils/eventBus";
+import { recentlyAddedSeeAllParams } from "@/utils/library/seeAll";
+import { storage } from "@/utils/mmkv";
+
+// Conditionally load TV version
+const HomeTV = Platform.isTV ? require("./Home.tv").Home : null;
+
+type InfiniteScrollingCollectionListSection = {
+  type: "InfiniteScrollingCollectionList";
+  title?: string;
+  queryKey: (string | undefined | null)[];
+  queryFn: QueryFunction<BaseItemDto[], any, number>;
+  orientation?: "horizontal" | "vertical";
+  pageSize?: number;
+  priority?: 1 | 2; // 1 = high priority (loads first), 2 = low priority
+  parentId?: string; // Library ID for "See All" navigation
+  collectionType?: BaseItemDto["CollectionType"]; // Decides the "See All" sort
+  showParentTitle?: boolean;
+};
+
+type MediaListSectionType = {
+  type: "MediaListSection";
+  queryKey: (string | undefined)[];
+  queryFn: QueryFunction<BaseItemDto>;
+  priority?: 1 | 2;
+};
+
+type Section = InfiniteScrollingCollectionListSection | MediaListSectionType;
+
+const HomeMobile = () => {
+  const router = useRouter();
+  const { t } = useTranslation();
+  const api = useAtomValue(apiAtom);
+  const user = useAtomValue(userAtom);
+  const insets = useSafeAreaInsets();
+  const [loading, setLoading] = useState(false);
+  const { settings, refreshStreamyfinPluginSettings } = useSettings();
+  const scrollRef = useRef<ScrollViewInstance>(null);
+  const { cleanCacheDirectory } = useDownload();
+  const prevIsConnected = useRef<boolean | null>(false);
+  const {
+    isConnected,
+    serverConnected,
+    loading: retryLoading,
+    retryCheck,
+  } = useNetworkStatus();
+  const invalidateCache = useInvalidatePlaybackProgressCache();
+  const [loadedSections, setLoadedSections] = useState<Set<string>>(new Set());
+  const { showIntro } = useIntroSheet();
+  // Gate the intro so it can't steal presentation from the post-login
+  // save-account sheet (both are BottomSheetModals): wait until no save is pending.
+  const pendingAccountSave = useAtomValue(pendingAccountSaveAtom);
+
+  // Fallback refresh for newly added content when returning to the home screen
+  // (primary path is the LibraryChanged WebSocket event).
+  useRefreshLibraryOnFocus();
+
+  // Show intro modal on first launch
+  useEffect(() => {
+    const hasShownIntro = storage.getBoolean("hasShownIntro");
+    // Defer while the save-account sheet is up; this effect re-runs and schedules
+    // the intro once the sheet is dismissed (pendingAccountSaveAtom cleared).
+    if (!hasShownIntro && !pendingAccountSave) {
+      const timer = setTimeout(() => {
+        showIntro();
+      }, 1000);
+
+      return () => {
+        clearTimeout(timer);
+      };
+    }
+  }, [showIntro, pendingAccountSave]);
+
+  useEffect(() => {
+    if (isConnected && !prevIsConnected.current) {
+      invalidateCache();
+    }
+    prevIsConnected.current = isConnected;
+  }, [isConnected, invalidateCache]);
+
+  useEffect(() => {
+    cleanCacheDirectory().catch((_e) =>
+      console.error("Something went wrong cleaning cache directory"),
+    );
+  }, []);
+
+  const segments = useSegments();
+  useEffect(() => {
+    const unsubscribe = eventBus.on("scrollToTop", () => {
+      if ((segments as string[])[2] === "(home)")
+        scrollRef.current?.scrollTo({
+          y: 0,
+          animated: true,
+        });
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [segments]);
+
+  const {
+    data,
+    isError: e1,
+    isLoading: l1,
+  } = useQuery({
+    queryKey: ["home", "userViews", user?.Id],
+    queryFn: async () => {
+      if (!api || !user?.Id) {
+        return null;
+      }
+
+      const response = await getUserViewApi(api).getUserViews({
+        userId: user.Id,
+      });
+
+      return response.data.Items || null;
+    },
+    enabled: !!api && !!user?.Id,
+    staleTime: 60 * 1000,
+  });
+  useRemapHiddenLibraries(data, user?.Id);
+
+  const latestMediaLibraries = useMemo(() => {
+    const excludedIds = new Set([
+      ...(settings.hiddenLibraries ?? []),
+      ...(user?.Configuration?.LatestItemsExcludes ?? []),
+    ]);
+    const excludedTypes = new Set([
+      "playlists",
+      "livetv",
+      "boxsets",
+      "channels",
+      "folders",
+    ]);
+
+    return (data ?? []).filter(
+      (library) =>
+        library.Id &&
+        !excludedIds.has(library.Id) &&
+        (!library.CollectionType || !excludedTypes.has(library.CollectionType)),
+    );
+  }, [
+    data,
+    settings.hiddenLibraries,
+    user?.Configuration?.LatestItemsExcludes,
+  ]);
+
+  const refetch = async () => {
+    setLoading(true);
+    setLoadedSections(new Set());
+    await refreshStreamyfinPluginSettings();
+    await invalidateCache();
+    setLoading(false);
+  };
+
+  const defaultSections = useMemo(() => {
+    if (!api || !user?.Id) return [];
+
+    const latestMediaViews =
+      latestMediaLibraries.map<InfiniteScrollingCollectionListSection>(
+        (library) => {
+          const title = t("home.recently_added_in", {
+            libraryName: library.Name,
+          });
+          const limit = library.CollectionType === "music" ? 30 : 16;
+          return {
+            title: title || "",
+            queryKey: [
+              "home",
+              "latestMedia",
+              api.basePath,
+              user.Id,
+              library.Id,
+            ],
+            queryFn: async ({ pageParam = 0 }) => {
+              if (pageParam > 0) return [];
+
+              return (
+                await getLibraryApi(api).getLatestMedia({
+                  userId: user.Id,
+                  parentId: library.Id,
+                  limit,
+                  fields: ["PrimaryImageAspectRatio", "Path"],
+                  imageTypeLimit: 1,
+                  enableImageTypes: ["Primary", "Backdrop", "Thumb"],
+                })
+              ).data;
+            },
+            type: "InfiniteScrollingCollectionList",
+            pageSize: limit + 1,
+            parentId: library.Id,
+            collectionType: library.CollectionType,
+            showParentTitle: true,
+          };
+        },
+      );
+
+    // Helper to sort items by most recent activity
+    const sortByRecentActivity = (items: BaseItemDto[]): BaseItemDto[] => {
+      return items.sort((a, b) => {
+        const dateA = a.UserData?.LastPlayedDate || a.DateCreated || "";
+        const dateB = b.UserData?.LastPlayedDate || b.DateCreated || "";
+        return new Date(dateB).getTime() - new Date(dateA).getTime();
+      });
+    };
+
+    // Helper to deduplicate items by ID
+    const deduplicateById = (items: BaseItemDto[]): BaseItemDto[] => {
+      const seen = new Set<string>();
+      return items.filter((item) => {
+        if (!item.Id || seen.has(item.Id)) return false;
+        seen.add(item.Id);
+        return true;
+      });
+    };
+
+    // Build the first sections based on merge setting
+    const firstSections: Section[] = settings.mergeNextUpAndContinueWatching
+      ? [
+          {
+            title: t("home.continue_and_next_up"),
+            queryKey: ["home", "continueAndNextUp"],
+            queryFn: async ({ pageParam = 0 }) => {
+              // Fetch both in parallel
+              const [resumeResponse, nextUpResponse] = await Promise.all([
+                getLibraryApi(api).getResumeItems({
+                  userId: user.Id,
+                  enableImageTypes: ["Primary", "Backdrop", "Thumb"],
+                  includeItemTypes: ["Movie", "Episode"],
+                  startIndex: 0,
+                  limit: 20,
+                }),
+                getShowApi(api).getNextUp({
+                  userId: user?.Id,
+                  startIndex: 0,
+                  limit: 20,
+                  enableImageTypes: ["Primary", "Backdrop", "Thumb"],
+                  enableResumable: false,
+                }),
+              ]);
+
+              const resumeItems = resumeResponse.data.Items || [];
+              const nextUpItems = nextUpResponse.data.Items || [];
+
+              // Combine, sort by recent activity, deduplicate
+              const combined = [...resumeItems, ...nextUpItems];
+              const sorted = sortByRecentActivity(combined);
+              const deduplicated = deduplicateById(sorted);
+
+              // Paginate client-side
+              return deduplicated.slice(pageParam, pageParam + 10);
+            },
+            type: "InfiniteScrollingCollectionList",
+            orientation: "horizontal",
+            pageSize: 10,
+            priority: 1,
+          },
+        ]
+      : [
+          {
+            title: t("home.continue_watching"),
+            queryKey: ["home", "resumeItems"],
+            queryFn: async ({ pageParam = 0 }) =>
+              (
+                await getLibraryApi(api).getResumeItems({
+                  userId: user.Id,
+                  enableImageTypes: ["Primary", "Backdrop", "Thumb"],
+                  includeItemTypes: ["Movie", "Episode"],
+                  startIndex: pageParam,
+                  limit: 10,
+                })
+              ).data.Items || [],
+            type: "InfiniteScrollingCollectionList",
+            orientation: "horizontal",
+            pageSize: 10,
+            priority: 1,
+          },
+          {
+            title: t("home.next_up"),
+            queryKey: ["home", "nextUp-all"],
+            queryFn: async ({ pageParam = 0 }) =>
+              (
+                await getShowApi(api).getNextUp({
+                  userId: user?.Id,
+                  startIndex: pageParam,
+                  limit: 10,
+                  enableImageTypes: ["Primary", "Backdrop", "Thumb"],
+                  enableResumable: false,
+                })
+              ).data.Items || [],
+            type: "InfiniteScrollingCollectionList",
+            orientation: "horizontal",
+            pageSize: 10,
+            priority: 1,
+          },
+        ];
+
+    // After Continue watching and Next up, where the TV home has it too.
+    const upcomingSections: Section[] = settings.showUpcomingOnHome
+      ? [
+          {
+            title: t("upcoming.title"),
+            queryKey: ["home", "upcoming", user.Id],
+            queryFn: ({ pageParam = 0 }) =>
+              fetchUpcomingEpisodes(api, {
+                userId: user.Id!,
+                startIndex: pageParam,
+                limit: UPCOMING_HOME_PAGE_SIZE,
+              }),
+            type: "InfiniteScrollingCollectionList",
+            orientation: "horizontal",
+            pageSize: UPCOMING_HOME_PAGE_SIZE,
+            priority: 2 as const,
+            showParentTitle: true,
+          },
+        ]
+      : [];
+
+    const ss: Section[] = [
+      ...firstSections,
+      ...upcomingSections,
+      ...latestMediaViews.map((s) => ({ ...s, priority: 2 as const })),
+      // Only show Jellyfin suggested movies if StreamyStats recommendations are disabled
+      ...(!settings?.streamyStatsMovieRecommendations
+        ? [
+            {
+              title: t("home.suggested_movies"),
+              queryKey: ["home", "suggestedMovies", user?.Id],
+              queryFn: async ({ pageParam = 0 }: { pageParam?: number }) =>
+                (
+                  await getSuggestionApi(api).getSuggestions({
+                    userId: user?.Id,
+                    startIndex: pageParam,
+                    limit: 10,
+                    mediaType: ["Video"],
+                    type: ["Movie"],
+                  })
+                ).data.Items || [],
+              type: "InfiniteScrollingCollectionList" as const,
+              orientation: "vertical" as const,
+              pageSize: 10,
+              priority: 2 as const,
+            },
+          ]
+        : []),
+    ];
+    return ss;
+  }, [
+    api,
+    user?.Id,
+    latestMediaLibraries,
+    t,
+    settings?.streamyStatsMovieRecommendations,
+    settings.mergeNextUpAndContinueWatching,
+    settings.showUpcomingOnHome,
+  ]);
+
+  const customSections = useMemo(() => {
+    if (!api || !user?.Id || !settings?.home?.sections) return [];
+    const ss: Section[] = [];
+    settings.home.sections.forEach((section, index) => {
+      const id = section.title || `section-${index}`;
+      const pageSize = 10;
+      ss.push({
+        title: t(`${id}`),
+        queryKey: ["home", "custom", String(index), section.title ?? null],
+        queryFn: ({ pageParam = 0 }) =>
+          fetchCustomHomeSection(api, {
+            section,
+            index,
+            userId: user?.Id,
+            pageParam,
+            pageSize,
+          }),
+        type: "InfiniteScrollingCollectionList",
+        orientation: section?.orientation || "vertical",
+        pageSize,
+        // First 2 custom sections are high priority
+        priority: index < 2 ? 1 : 2,
+      });
+    });
+    return ss;
+  }, [api, user?.Id, settings?.home?.sections, t]);
+
+  const sections = settings?.home?.sections ? customSections : defaultSections;
+
+  // Get all high priority section keys and check if all have loaded
+  const highPrioritySectionKeys = useMemo(() => {
+    return sections
+      .filter((s) => s.priority === 1)
+      .map((s) => s.queryKey.join("-"));
+  }, [sections]);
+
+  const allHighPriorityLoaded = useMemo(() => {
+    return highPrioritySectionKeys.every((key) => loadedSections.has(key));
+  }, [highPrioritySectionKeys, loadedSections]);
+
+  const markSectionLoaded = useCallback(
+    (queryKey: (string | undefined | null)[]) => {
+      const key = queryKey.join("-");
+      setLoadedSections((prev) => new Set(prev).add(key));
+    },
+    [],
+  );
+
+  if (!isConnected || serverConnected !== true) {
+    let title = "";
+    let subtitle = "";
+
+    if (!isConnected) {
+      title = t("home.no_internet");
+      subtitle = t("home.no_internet_message");
+    } else if (serverConnected === null) {
+      title = t("home.checking_server_connection");
+      subtitle = t("home.checking_server_connection_message");
+    } else if (!serverConnected) {
+      title = t("home.server_unreachable");
+      subtitle = t("home.server_unreachable_message");
+    }
+    return (
+      <View className='flex flex-col items-center justify-center h-full -mt-6 px-8'>
+        <Text className='text-3xl font-bold mb-2'>{title}</Text>
+        <Text className='text-center opacity-70'>{subtitle}</Text>
+
+        <View className='mt-4'>
+          {!Platform.isTV && (
+            <Button
+              color='purple'
+              onPress={() => router.push("/downloaded")}
+              justify='center'
+              iconRight={
+                <Ionicons name='arrow-forward' size={20} color='white' />
+              }
+            >
+              {t("home.go_to_downloads")}
+            </Button>
+          )}
+
+          <Button
+            color='black'
+            onPress={retryCheck}
+            justify='center'
+            className='mt-2'
+            iconRight={
+              retryLoading ? null : (
+                <Ionicons name='refresh' size={20} color='white' />
+              )
+            }
+          >
+            {retryLoading ? (
+              <ActivityIndicator size='small' color='white' />
+            ) : (
+              t("home.retry")
+            )}
+          </Button>
+        </View>
+      </View>
+    );
+  }
+
+  if (e1)
+    return (
+      <View className='flex flex-col items-center justify-center h-full -mt-6'>
+        <Text className='text-3xl font-bold mb-2'>{t("home.oops")}</Text>
+        <Text className='text-center opacity-70'>
+          {t("home.error_message")}
+        </Text>
+      </View>
+    );
+
+  if (l1)
+    return (
+      <View className='justify-center items-center h-full'>
+        <Loader />
+      </View>
+    );
+
+  const homeContent = (
+    <ScrollView
+      ref={scrollRef}
+      nestedScrollEnabled
+      refreshControl={
+        <RefreshControl
+          refreshing={loading}
+          onRefresh={refetch}
+          tintColor='white'
+          colors={["white"]}
+        />
+      }
+      contentContainerStyle={{
+        paddingLeft: insets.left,
+        paddingRight: insets.right,
+        paddingBottom: 16,
+        paddingTop: 10,
+      }}
+    >
+      <HomeHeroCarousel />
+      {sections.map((section, index) => {
+        // Render Streamystats sections after Recently Added sections
+        // For default sections: place after Recently Added, before Suggested Movies (if present)
+        // For custom sections: place at the very end
+        const hasSuggestedMovies =
+          !settings?.streamyStatsMovieRecommendations &&
+          !settings?.home?.sections;
+        const streamystatsIndex =
+          sections.length - 1 - (hasSuggestedMovies ? 1 : 0);
+        const hasStreamystatsContent =
+          settings.streamyStatsMovieRecommendations ||
+          settings.streamyStatsSeriesRecommendations ||
+          settings.streamyStatsPromotedWatchlists;
+        const streamystatsSections =
+          index === streamystatsIndex && hasStreamystatsContent ? (
+            <View
+              key='streamystats-sections'
+              className='flex flex-col space-y-4'
+            >
+              {settings.streamyStatsMovieRecommendations && (
+                <StreamystatsRecommendations
+                  title={t(
+                    "home.settings.plugins.streamystats.recommended_movies",
+                  )}
+                  type='Movie'
+                  enabled={allHighPriorityLoaded}
+                />
+              )}
+              {settings.streamyStatsSeriesRecommendations && (
+                <StreamystatsRecommendations
+                  title={t(
+                    "home.settings.plugins.streamystats.recommended_series",
+                  )}
+                  type='Series'
+                  enabled={allHighPriorityLoaded}
+                />
+              )}
+              {settings.streamyStatsPromotedWatchlists && (
+                <StreamystatsPromotedWatchlists
+                  enabled={allHighPriorityLoaded}
+                />
+              )}
+            </View>
+          ) : null;
+        if (section.type === "InfiniteScrollingCollectionList") {
+          const isHighPriority = section.priority === 1;
+          const handleSeeAll = section.parentId
+            ? () => {
+                router.push({
+                  pathname: "/(auth)/(tabs)/(libraries)/[libraryId]",
+                  params: {
+                    libraryId: section.parentId!,
+                    ...recentlyAddedSeeAllParams(section.collectionType),
+                  },
+                } as any);
+              }
+            : undefined;
+          return (
+            <Fragment key={index}>
+              <InfiniteScrollingCollectionList
+                style={{ marginBottom: 20 }}
+                title={section.title}
+                queryKey={section.queryKey}
+                queryFn={section.queryFn}
+                orientation={section.orientation}
+                hideIfEmpty
+                pageSize={section.pageSize}
+                enabled={isHighPriority || allHighPriorityLoaded}
+                onLoaded={
+                  isHighPriority
+                    ? () => markSectionLoaded(section.queryKey)
+                    : undefined
+                }
+                onPressSeeAll={handleSeeAll}
+                showParentTitle={section.showParentTitle}
+              />
+              {streamystatsSections}
+            </Fragment>
+          );
+        }
+        if (section.type === "MediaListSection") {
+          return (
+            <Fragment key={index}>
+              <MediaListSection
+                style={{ marginBottom: 20 }}
+                queryKey={section.queryKey}
+                queryFn={section.queryFn}
+              />
+              {streamystatsSections}
+            </Fragment>
+          );
+        }
+        return null;
+      })}
+    </ScrollView>
+  );
+
+  return (
+    <HomeFolders libraries={data} hiddenLibraries={settings.hiddenLibraries}>
+      {homeContent}
+    </HomeFolders>
+  );
+};
+
+// Exported component that renders TV or mobile version based on platform
+export const Home = () => {
+  if (Platform.isTV && HomeTV) {
+    return <HomeTV />;
+  }
+  return <HomeMobile />;
+};

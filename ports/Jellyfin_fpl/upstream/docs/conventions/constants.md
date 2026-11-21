@@ -1,0 +1,81 @@
+# Constants
+
+Values that steer behaviour live in `constants/`, not inline in the component or provider
+that happens to use them first.
+
+## The test
+
+A value belongs in `constants/` when either is true:
+
+1. **It is used by more than one file.** Two definitions of one value is two places to
+   fix and one silent divergence waiting to happen.
+2. **It is policy, not layout detail.** Thresholds, intervals, timeouts, ratios, retry
+   counts, storage keys, feature limits: anything a reviewer might want to tune without
+   reading the surrounding code.
+
+Everything else may stay next to the code that uses it, but it still gets a name. A bare
+`0.85` in a style block is unreadable whether it lives in `constants/` or not.
+
+## Why this rule exists
+
+`PROGRESS_REPORT_INTERVAL` was defined twice, as `10000` in
+`app/(auth)/player/direct-player.tsx` and as `10_000` in
+`providers/NativePlayerProvider.tsx`. Same policy, two owners. Changing the reporting
+cadence meant knowing both existed, and nothing would have failed if only one had moved.
+
+## Where each kind goes
+
+| File | Holds |
+| --- | --- |
+| `constants/Values.ts` | Cross cutting app values with no better home (tab height, carousel height, sheet ratio) |
+| `constants/Keyboard.ts` | What the app passes to the keyboard: the start of the id that keeps the toolbar away from an iOS number pad |
+| `constants/Colors.ts` | Colour tokens |
+| `constants/MediaTypes.ts` | Media type unions |
+| `constants/Images.ts` | Server image requests: the detail page logo height, and the pixel caps and steps on what is asked for |
+| `constants/TVSizes.ts` | TV poster sizes, gaps, padding, animation timings, how close to the end a growing grid asks for more, where Android TV's top tab bar ends |
+| `constants/TVTypography.ts` | TV type scale and the `useScaledTVTypography` hook |
+| `constants/TVSheet.ts` | How TV sheets come in: backdrop fade, slide, and the delays before their cards mount and take focus |
+| `constants/TVPosterSizes.ts` | TV poster size keys |
+| `constants/TVDetailLayout.ts` | A TV detail page's layout shares of the window: the poster beside the header, the overview's widest, the header's lowest, which the loading skeleton reads too |
+| `constants/LiveTVGuide.ts` | The phone's Live TV guide: an hour's width, the channel column, and how far before a program's end its pinned title stops |
+| `constants/Playback.ts` | Playback policy shared by the JS and native players (progress report cadence, next-episode countdown window, play queue size cap), how long a remote repeat or shuffle change waits to be confirmed, how often the stats overlay polls the transcode progress, how long a new native player waits for a closing one, and the query families that show watch progress |
+| `constants/Bitrate.ts` | Streaming quality: the keys of Auto and Max and how both travel to the players, the cast receiver's own ceiling, and how Auto is measured (jellyfin-web's speed tests, their sizes and thresholds, the share of the rate kept, the in-network floor, how long a measure is reused and a failed one remembered, when a stream played counts as downloaded, and the choices the Auto settings offer for them), and how Auto adapts during playback (what counts as a stall or a low cache, the grace after a start or a seek, how a step down is sized, when the link is measured again to step back up). The caps themselves, `BITRATES`, are in `constants/Playback.ts` |
+| `constants/Logs.ts` | App log storage key and how many entries it keeps |
+| `constants/Privacy.ts` | What stands in for a secret in anything the app writes out (log, Sentry) |
+| `constants/Music.ts` | Music player policy: the volume normalization modes, their default, and the gain ceiling; the storage key of the stored tracks index |
+| `constants/Streamystats.ts` | Streamystats server: how long a watchlists request waits for an answer, and how many times a refresh behind lists already shown is retried |
+| `constants/Search.ts` | Library search: results asked for per section, the person types the People section leaves out, a studio page's size |
+| `constants/Inactivity.ts` | The TV inactivity sign-out's storage key for the last activity |
+| `constants/StillWatching.ts` | The "Still watching?" presets, jellyfin-web 12's episode counts and session minutes |
+| `constants/Sentry.ts` | Error reporting policy: which builds report, the per session dedupe cap, the failure storm window |
+| `constants/Query.ts` | The app's query client: how many times a failed query is tried again |
+| `constants/Jellyfin.ts` | The Jellyfin server itself: the product name that identifies one in its public system info, how long that info is trusted, the two ways it writes an item id, and the bracketed forms it also reads one in |
+| `constants/Upcoming.ts` | Upcoming episodes: how many are asked per request, on the screen and in the home row |
+| `constants/Hero.ts` | The home hero cards: the largest font scale they follow on a phone, and the window width from which they follow the system's |
+| `constants/TVDiscovery.ts` | TV home screen tiles: Top Shelf and Android TV recommendations (play link lookup timeout) |
+| `constants/Recommendations.ts` | Similar item rows: how many items a detail page asks the server for, and for which kinds of item |
+| `constants/Notifications.ts` | Push notifications: the plugin route a device registers at and is deleted from on sign out |
+| `constants/QuickConnect.ts` | Quick Connect: how long a code stays valid, the wait between two polls of it, and how long one request may take |
+| `constants/QueryPersistence.ts` | The query cache written to disk: which query key families are kept, and how many pages of an infinite query |
+| `constants/Cast.ts` | Official Jellyfin Cast receiver: its session client name, the name it gets for a TV whose own name it cannot take, how long a cast waits for the TV to start, how many times its channel is tried, and the window and waits used to tell a stopped receiver from a live one |
+| `constants/CastCrew.ts` | Cast and crew on item detail pages: how many actors the TV text line and the TV cast cards show, and how many get a "more movies with" row. |
+
+Add a new domain file when a group grows its own identity (playback, downloads,
+networking). Do not let `Values.ts` become the place where everything lands.
+
+## Rules
+
+- Import through the alias: `import { TAB_HEIGHT } from "@/constants/Values"`.
+- `SCREAMING_SNAKE_CASE` for scalars, `PascalCase` for grouped objects, matching what is
+  already there.
+- Give the constant a comment when the number encodes a decision. `SHEET_MAX_HEIGHT_RATIO`
+  explains why the sheet stops at 0.85, and that sentence is worth more than the value.
+- A value used by two modules never has two definitions. If you find one, collapse it as
+  part of the change you are already making.
+- Platform branches are fine inside a constant (`TAB_HEIGHT` does it) as long as callers
+  stay unaware.
+
+## When you touch a file that still has magic literals
+
+Move them as part of that change. This is how the codebase converges without a dedicated
+cleanup that nobody schedules.

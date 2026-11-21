@@ -1,0 +1,424 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+#include "platform/system_config.h"
+#include "platform/device_adapter.h"
+#include "platform/files.h"
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+static bool path_for(char path[4096], const char *sd, const char *suffix)
+{
+    int n = snprintf(path, 4096, "%s/system.json%s", sd, suffix);
+    return n > 0 && n < 4096;
+}
+
+static MainUIShortcut read_button_shortcut(const char *sd, char button, char why[160])
+{
+    char path[4096], scratch[160];
+    why = why ? why : scratch;
+    *why = 0;
+    if (!sd ||
+        snprintf(path, sizeof path, "%s/.tmp_update/config/keymap.json", sd) >= (int)sizeof path) {
+        snprintf(why, 160, "the keymap path is too long");
+        return MAINUI_SHORTCUT_KEYMON;
+    }
+    struct stat info;
+    if (stat(path, &info) != 0 && errno == ENOENT) {
+        return MAINUI_SHORTCUT_NONE; /* as keymon without the file */
+    }
+    if (stat(path, &info) == 0 && !S_ISREG(info.st_mode)) {
+        snprintf(why, 160, "keymap.json is not a file");
+        return MAINUI_SHORTCUT_KEYMON;
+    }
+    errno = 0;
+    char *text = mainui_read_text(path, 64 * 1024);
+    if (!text) {
+        snprintf(why, 160, "keymap.json cannot be read: %s",
+                 errno ? strerror(errno) : "unreadable");
+        return MAINUI_SHORTCUT_KEYMON;
+    }
+    cJSON *root = cJSON_Parse(text);
+    free(text);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        snprintf(why, 160, "keymap.json is not a JSON object");
+        return MAINUI_SHORTCUT_KEYMON;
+    }
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, button == 'X' ? "mainui_button_x"
+                                                                              : "mainui_button_y");
+    MainUIShortcut result = MAINUI_SHORTCUT_KEYMON;
+    /* false, or exactly "disable", turns the button off in MainUI. */
+    if (cJSON_IsFalse(value) || (cJSON_IsString(value) && !strcmp(value->valuestring, "disable"))) {
+        result = MAINUI_SHORTCUT_DISABLED;
+    }
+    /* keymon keeps its empty default unless the value is text. */
+    else if (!cJSON_IsString(value) || !*value->valuestring) {
+        result = MAINUI_SHORTCUT_NONE;
+    }
+    else if (!strcmp(value->valuestring, "glo")) {
+        result = MAINUI_SHORTCUT_GAME_OPTIONS;
+    }
+    else if (!strcmp(value->valuestring, "fav")) {
+        result = MAINUI_SHORTCUT_FAVORITE;
+    }
+    else {
+        /* An app or tool, which keymon runs (it missed this press), or a
+         * value keymon does not know: starting the game would surprise. */
+        snprintf(why, 160, "the %c shortcut is %.60s, which keymon runs", button,
+                 value->valuestring);
+    }
+    cJSON_Delete(root);
+    return result;
+}
+
+/* Button events are frequent: a file-stamp check avoids parsing keymap.json
+ * repeatedly, while edits become visible without restarting MainUI. The
+ * result and diagnostic for each button are cached together. UI thread only. */
+MainUIShortcut mainui_button_shortcut(const char *sd, char button, char why[160])
+{
+    typedef struct {
+        char sd[4096];
+        MainUIFileStamp stamp;
+        MainUIShortcut x, y;
+        char x_why[160], y_why[160];
+        bool valid;
+    } ShortcutCache;
+
+    static ShortcutCache cache;
+    if (!sd || (button != 'X' && button != 'Y') || strlen(sd) >= sizeof cache.sd) {
+        return read_button_shortcut(sd, button, why);
+    }
+    char path[4096];
+    int n = snprintf(path, sizeof path, "%s/.tmp_update/config/keymap.json", sd);
+    if (n <= 0 || n >= (int)sizeof path) {
+        return read_button_shortcut(sd, button, why);
+    }
+    MainUIFileStamp stamp = mainui_file_stamp(path);
+    if (!cache.valid || strcmp(cache.sd, sd) || !mainui_file_stamp_equal(stamp, cache.stamp)) {
+        cache.x = read_button_shortcut(sd, 'X', cache.x_why);
+        cache.y = read_button_shortcut(sd, 'Y', cache.y_why);
+        cache.stamp = stamp;
+        snprintf(cache.sd, sizeof cache.sd, "%s", sd);
+        cache.valid = true;
+    }
+    if (why) {
+        snprintf(why, 160, "%s", button == 'X' ? cache.x_why : cache.y_why);
+    }
+    return button == 'X' ? cache.x : cache.y;
+}
+
+cJSON *mainui_system_read(const char *sd)
+{
+    char path[4096];
+    if (!path_for(path, sd, "")) {
+        return NULL;
+    }
+    /* Distinguish a missing file from unreadable or malformed existing data. */
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return errno == ENOENT ? cJSON_CreateObject() : NULL;
+    }
+    fclose(file);
+    char *text = mainui_read_text(path, 1024 * 1024);
+    /* Blank files have no settings to preserve; nonempty malformed data does. */
+    bool blank = text && text[strspn(text, " \t\r\n")] == 0;
+    cJSON *root =
+        blank ? cJSON_CreateObject() : (text ? cJSON_ParseWithOpts(text, NULL, true) : NULL);
+    free(text);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return NULL;
+    }
+    return root;
+}
+
+/* Exactly eight comma-separated names, each one the default names. */
+static bool keymap_valid(const char *value)
+{
+    static const char *const names[] = {"L2", "L", "R2", "R", "X", "A", "B", "Y"};
+    int count = 0;
+    for (const char *part = value;;) {
+        const char *end = strchr(part, ',');
+        size_t length = end ? (size_t)(end - part) : strlen(part);
+        bool known = false;
+        for (size_t i = 0; i < sizeof names / sizeof *names && !known; i++) {
+            known = strlen(names[i]) == length && !strncmp(part, names[i], length);
+        }
+        if (!known || ++count > 8) {
+            return false;
+        }
+        if (!end) {
+            return count == 8;
+        }
+        part = end + 1;
+    }
+}
+
+const char *mainui_keymap_value(const cJSON *settings)
+{
+    const cJSON *keymap = cJSON_GetObjectItemCaseSensitive(settings, "keymap");
+    const char *value = cJSON_IsString(keymap) ? keymap->valuestring : NULL;
+    return value && keymap_valid(value) ? value : MAINUI_DEFAULT_KEYMAP;
+}
+
+bool mainui_keymap_apply(const char *sd, const char *target)
+{
+    cJSON *settings = mainui_system_read(sd);
+    const cJSON *keymap = cJSON_GetObjectItemCaseSensitive(settings, "keymap");
+    if (cJSON_IsString(keymap) && *keymap->valuestring && !keymap_valid(keymap->valuestring)) {
+        fprintf(stderr, "Ignoring unusable keymap in system.json: %.80s\n", keymap->valuestring);
+    }
+    FILE *file = fopen(target, "w");
+    bool ok = file && fputs(mainui_keymap_value(settings), file) >= 0;
+    if (file && fclose(file) != 0) {
+        ok = false;
+    }
+    cJSON_Delete(settings);
+    return ok;
+}
+
+static const MainUISettingsMonitor *installed_monitor;
+
+void mainui_system_set_monitor(const MainUISettingsMonitor *monitor)
+{
+    installed_monitor = monitor;
+}
+
+#ifdef MAINUI_ONION
+static bool keymon_get(void *context, const char *key, int *value)
+{
+    return mainui_device_setting_value(context, key, value);
+}
+
+static bool keymon_set(void *context, const char *key, int value)
+{
+    return mainui_device_setting_sync(context, key, value);
+}
+#endif
+
+/* The live copy to keep in step: a test's, or keymon's for the real card. */
+static const MainUISettingsMonitor *monitor_for(const char *sd)
+{
+    if (installed_monitor) {
+        return installed_monitor;
+    }
+#ifdef MAINUI_ONION
+    static MainUIDeviceAdapter adapter = {.backend = DEVICE_ONION};
+    static const MainUISettingsMonitor keymon = {keymon_get, keymon_set, &adapter};
+    if (!strcmp(sd, "/mnt/SDCARD")) {
+        return &keymon;
+    }
+#else
+    (void)sd;
+#endif
+    return NULL;
+}
+
+typedef struct {
+    const char *key;
+    int before, after;
+} MonitorChange;
+
+/* The file was not replaced: put back the live values this save changed.
+ * Only a value still holding what was written here is restored, so a newer
+ * change by keymon is kept. Reading and writing are separate steps of the
+ * shared memory, not one atomic exchange; keymon changing a value between
+ * them is not detected. False when a value could not be put back, or was
+ * changed meanwhile: the live value then differs from the file. */
+static bool restore_monitor(const MainUISettingsMonitor *monitor, MonitorChange *changes, int count)
+{
+    bool restored = true;
+    for (int i = count - 1; i >= 0; i--) {
+        int now = 0;
+        bool read = monitor->get(monitor->context, changes[i].key, &now);
+        /* Still the old value (the write did not take) needs nothing. */
+        bool ok = read && (now == changes[i].before ||
+                           (now == changes[i].after &&
+                            monitor->set(monitor->context, changes[i].key, changes[i].before) &&
+                            monitor->get(monitor->context, changes[i].key, &now) &&
+                            now == changes[i].before));
+        if (!ok) {
+            fprintf(stderr, "Settings: the live value of %s could not be put back\n",
+                    changes[i].key);
+            restored = false;
+        }
+    }
+    return restored;
+}
+
+/* A save that failed after system.json was read: the keys, and whether the
+ * live values were put back. Failures only, since a save runs on every value
+ * change; a damaged file is reported by the caller, once. */
+static void log_not_saved(const char *path, const cJSON *values, MainUISettingsResult result)
+{
+    char keys[256] = "";
+    size_t used = 0;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, values)
+    {
+        int n = snprintf(keys + used, sizeof keys - used, "%s%s", used ? ", " : "",
+                         item->string ? item->string : "?");
+        if (n < 0 || (size_t)n >= sizeof keys - used) {
+            break;
+        }
+        used += (size_t)n;
+    }
+    fprintf(stderr, "[settings] %s not saved to %s%s\n", keys, path,
+            result == MAINUI_SETTINGS_PARTLY
+                ? "; a live value could not be put back and may differ from the file"
+                : "; the previous values are in effect");
+}
+
+static MainUISettingsResult patch_unlocked(const char *sd, const cJSON *values)
+{
+    cJSON *root = mainui_system_read(sd);
+    if (!root || !cJSON_IsObject(values)) {
+        cJSON_Delete(root);
+        return MAINUI_SETTINGS_NOT_SAVED;
+    }
+    /* Everything that can fail without side effects comes first: the new
+     * document, its text and its path. */
+    const cJSON *item;
+    cJSON_ArrayForEach(item, values)
+    {
+        cJSON *copy = cJSON_Duplicate(item, true);
+        /* Every occurrence: a duplicate left behind would be read instead. */
+        while (cJSON_GetObjectItemCaseSensitive(root, item->string)) {
+            cJSON_DeleteItemFromObjectCaseSensitive(root, item->string);
+        }
+        if (!copy || !cJSON_AddItemToObject(root, item->string, copy)) {
+            cJSON_Delete(copy);
+            cJSON_Delete(root);
+            return MAINUI_SETTINGS_NOT_SAVED;
+        }
+    }
+    char *text = cJSON_Print(root);
+    cJSON_Delete(root);
+    char path[4096];
+    if (!text || !path_for(path, sd, "")) {
+        free(text);
+        return MAINUI_SETTINGS_NOT_SAVED;
+    }
+    /* keymon writes its live values back to system.json, so they change
+     * first; if the file then cannot be replaced, they are put back. */
+    const MainUISettingsMonitor *monitor = monitor_for(sd);
+    MonitorChange changes[32];
+    int count = 0;
+    bool ok = true;
+    cJSON_ArrayForEach(item, values)
+    {
+        if (!monitor || !cJSON_IsNumber(item) || count == (int)(sizeof changes / sizeof *changes)) {
+            continue;
+        }
+        MonitorChange change = {.key = item->string, .after = item->valueint};
+        /* A value the monitor does not keep, or cannot read (then it cannot
+         * be written either), needs nothing put back. */
+        bool kept = monitor->get(monitor->context, item->string, &change.before);
+        if (kept) {
+            changes[count++] = change; /* even unconfirmed, it may have changed */
+        }
+        if (!monitor->set(monitor->context, item->string, item->valueint)) {
+            ok = false;
+            break;
+        }
+    }
+    ok = ok && mainui_write_text_atomic_result(path, text) != MAINUI_WRITE_UNCHANGED;
+    free(text);
+    if (ok) {
+        return MAINUI_SETTINGS_SAVED;
+    }
+    MainUISettingsResult result = !monitor || restore_monitor(monitor, changes, count)
+                                      ? MAINUI_SETTINGS_NOT_SAVED
+                                      : MAINUI_SETTINGS_PARTLY;
+    log_not_saved(path, values, result);
+    return result;
+}
+
+int mainui_system_monitor_value(const cJSON *settings, const char *key)
+{
+    static const struct {
+        const char *key;
+        int fallback;
+        bool ranged; /* 0 to 20 */
+    } stock[] = {{"vol", 20, false},    {"brightness", 7, false}, {"mute", 0, false},
+                 {"bgmvol", 8, false},  {"hibernate", 0, false},  {"lumination", 7, true},
+                 {"hue", 10, true},     {"saturation", 10, true}, {"contrast", 10, true},
+                 {"audiofix", 1, false}};
+
+    for (size_t i = 0; i < sizeof stock / sizeof *stock; ++i) {
+        if (strcmp(key, stock[i].key)) {
+            continue;
+        }
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(settings, key);
+        if (!cJSON_IsNumber(value) || value->valuedouble < INT_MIN ||
+            value->valuedouble > INT_MAX) {
+            return stock[i].fallback;
+        }
+        int number = (int)value->valuedouble;
+        return stock[i].ranged && (number < 0 || number > 20) ? stock[i].fallback : number;
+    }
+    return 0;
+}
+
+bool mainui_system_damaged(const char *sd)
+{
+    char path[4096];
+    if (!path_for(path, sd, "")) {
+        return false;
+    }
+    char *text = mainui_read_text(path, 1024 * 1024);
+    if (!text) {
+        return errno == EINVAL || errno == EFBIG; /* NUL bytes, or too large */
+    }
+    bool blank = text[strspn(text, " \t\r\n")] == 0;
+    cJSON *root = blank ? NULL : cJSON_ParseWithOpts(text, NULL, true);
+    bool damaged = !blank && !cJSON_IsObject(root);
+    cJSON_Delete(root);
+    free(text);
+    return damaged;
+}
+
+MainUISettingsResult mainui_system_write_result(const char *sd, const char *key, const cJSON *value)
+{
+    cJSON *values = cJSON_CreateObject();
+    cJSON *copy = cJSON_Duplicate(value, true);
+    bool ok = values && copy && cJSON_AddItemToObject(values, key, copy);
+    if (!ok) {
+        cJSON_Delete(copy);
+    }
+    MainUISettingsResult result =
+        ok ? mainui_system_patch_result(sd, values) : MAINUI_SETTINGS_NOT_SAVED;
+    cJSON_Delete(values);
+    return result;
+}
+
+bool mainui_system_write(const char *sd, const char *key, const cJSON *value)
+{
+    return mainui_system_write_result(sd, key, value) == MAINUI_SETTINGS_SAVED;
+}
+
+MainUISettingsResult mainui_system_patch_result(const char *sd, const cJSON *values)
+{
+    char path[4096];
+    if (!path_for(path, sd, "")) {
+        return MAINUI_SETTINGS_NOT_SAVED;
+    }
+    MainUIFileLock *lock = mainui_file_lock(path);
+    MainUISettingsResult result = lock ? patch_unlocked(sd, values) : MAINUI_SETTINGS_NOT_SAVED;
+    mainui_file_unlock(lock);
+    return result;
+}
+
+bool mainui_system_patch(const char *sd, const cJSON *values)
+{
+    return mainui_system_patch_result(sd, values) == MAINUI_SETTINGS_SAVED;
+}
+
+bool mainui_system_live_value(const char *sd, const char *key, int *value)
+{
+    const MainUISettingsMonitor *monitor = monitor_for(sd);
+    return monitor && monitor->get(monitor->context, key, value);
+}

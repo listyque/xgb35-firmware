@@ -1,0 +1,531 @@
+import type {
+  BaseItemDto,
+  MediaSourceInfo,
+} from "@jellyfin/sdk/lib/generated-client/models";
+import { act, renderHook, waitFor } from "@testing-library/react-native";
+import {
+  DISK_AVAILABLE,
+  DISK_TOTAL,
+  DOCUMENTS,
+  fakeFiles,
+} from "@/test-utils/fileSystem";
+import { clearMmkv } from "@/test-utils/mmkv";
+
+// The pending records are real, over the MMKV double: they are what cancel reads its files from.
+const mockDownloader = {
+  enqueueDownload: jest.fn(),
+  cancelDownload: jest.fn(),
+  cancelQueuedDownload: jest.fn(),
+};
+jest.mock("@/modules", () => ({
+  get BackgroundDownloader() {
+    return mockDownloader;
+  },
+}));
+const mockDownloadAdditionalAssets = jest.fn();
+jest.mock("../additionalDownloads", () => ({
+  downloadAdditionalAssets: (...args: unknown[]) =>
+    mockDownloadAdditionalAssets(...args),
+}));
+const mockBuildDownloadActivityMetadata = jest.fn();
+jest.mock("../liveActivity", () => ({
+  buildDownloadActivityMetadata: () => mockBuildDownloadActivityMetadata(),
+}));
+jest.mock("@/hooks/useImageStorage", () => ({
+  __esModule: true,
+  default: () => ({ saveImage: jest.fn() }),
+}));
+jest.mock("@/utils/download", () => ({
+  __esModule: true,
+  default: () => ({ saveSeriesPrimaryImage: jest.fn() }),
+}));
+jest.mock("@/utils/customHeaders", () =>
+  jest.requireActual("@/test-utils/customHeaders").customHeadersModule(),
+);
+
+import { toast } from "sonner-native";
+import {
+  getPendingDownload,
+  removePendingDownload,
+  savePendingDownload,
+} from "../pendingDownloads";
+import { getDownloadToastId } from "../utils";
+import { useDownloadOperations } from "./useDownloadOperations";
+
+const SUBTITLE = `${DOCUMENTS}/show_s01e01_subtitle_2.subrip`;
+const TRICKPLAY = `${DOCUMENTS}/show_s01e01_trickplay`;
+const SIDECARS = [SUBTITLE, TRICKPLAY, `${TRICKPLAY}/0.jpg`];
+
+const item: BaseItemDto = {
+  Id: "item-1",
+  Name: "Neverland",
+  Type: "Episode",
+  SeriesName: "Show",
+  ParentIndexNumber: 1,
+  IndexNumber: 1,
+};
+const mediaSource: MediaSourceInfo = {
+  MediaStreams: [
+    {
+      Type: "Subtitle",
+      DeliveryMethod: "External",
+      Index: 2,
+      Codec: "subrip",
+      DeliveryUrl: SUBTITLE,
+    },
+  ],
+};
+const url = "https://jellyfin.example/Items/item-1/Download";
+const maxBitrate = { key: "Max", value: undefined };
+
+const renderOperations = async () => {
+  const removeProcess = jest.fn();
+  const setProcesses = jest.fn();
+  const { result } = await renderHook(() =>
+    useDownloadOperations({
+      processes: [],
+      setProcesses,
+      removeProcess,
+      api: { basePath: "https://jellyfin.example" },
+      authHeader: "token",
+    }),
+  );
+  return { operations: result.current, removeProcess, setProcesses };
+};
+
+/** A step of the start that stays pending until the test lets it through. */
+const hold = <T>() => {
+  let release!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+};
+
+/** What downloadAdditionalAssets does before the video is handed to native. */
+const writeSidecars = () => {
+  fakeFiles.add(...SIDECARS);
+  return {
+    updatedMediaSource: mediaSource,
+    trickPlayData: { path: `${TRICKPLAY}/`, size: 1 },
+  };
+};
+
+beforeEach(() => {
+  clearMmkv();
+  fakeFiles.clear();
+  jest.clearAllMocks();
+  mockDownloader.enqueueDownload.mockResolvedValue(7);
+  mockBuildDownloadActivityMetadata.mockResolvedValue(undefined);
+  mockDownloadAdditionalAssets.mockImplementation(async () => writeSidecars());
+  jest.spyOn(console, "log").mockImplementation(() => {});
+  jest.spyOn(console, "warn").mockImplementation(() => {});
+  jest.spyOn(console, "error").mockImplementation(() => {});
+});
+
+afterEach(() => jest.restoreAllMocks());
+
+describe("cancelDownload", () => {
+  // Cancelling only stopped the transfer and dropped the record: the subtitles and trickplay
+  // sheets written before the video was enqueued stayed in Documents.
+  it("removes the files the download had already written", async () => {
+    const { operations, removeProcess } = await renderOperations();
+    await act(() =>
+      operations.startBackgroundDownload(url, item, mediaSource, maxBitrate),
+    );
+    expect(fakeFiles.remaining()).toEqual(SIDECARS);
+
+    await act(() => operations.cancelDownload("item-1"));
+
+    expect(mockDownloader.cancelDownload).toHaveBeenCalledWith(7);
+    expect(getPendingDownload("item-1")).toBeUndefined();
+    expect(removeProcess).toHaveBeenCalledWith("item-1");
+    expect(fakeFiles.remaining()).toEqual([]);
+  });
+
+  // A download that already finished has no pending record. Its card lingers for a moment, and
+  // cancelling it then must not take the finished download's files.
+  it("deletes nothing when there is no pending record", async () => {
+    fakeFiles.add(...SIDECARS);
+    const { operations } = await renderOperations();
+
+    await act(() => operations.cancelDownload("item-1"));
+
+    expect(fakeFiles.deleted()).toEqual([]);
+  });
+
+  // The card, and its cancel button, is on screen before the pending record is saved: staging
+  // the Live Activity poster sits in between. A cancel in that window found no record, so it
+  // cancelled nothing, and the start then saved the record and enqueued a download that ran
+  // with no card.
+  describe("while the download is still being prepared", () => {
+    it("enqueues nothing and removes what the start had written", async () => {
+      const staging = hold<undefined>();
+      mockBuildDownloadActivityMetadata.mockReturnValue(staging.promise);
+      const { operations, setProcesses } = await renderOperations();
+
+      const started = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() => expect(setProcesses).toHaveBeenCalled());
+      await act(() => operations.cancelDownload("item-1"));
+      staging.release(undefined);
+      await act(() => started);
+
+      expect(mockDownloader.enqueueDownload).not.toHaveBeenCalled();
+      expect(getPendingDownload("item-1")).toBeUndefined();
+      expect(fakeFiles.remaining()).toEqual([]);
+      expect(toast.success).not.toHaveBeenCalled();
+    });
+
+    // Native has the download by the time enqueueDownload resolves, but the record carries no
+    // task id until then, so the cancel could only try the queue.
+    it("stops a download native started while it was being cancelled", async () => {
+      const enqueue = hold<number>();
+      mockDownloader.enqueueDownload.mockReturnValue(enqueue.promise);
+      const { operations } = await renderOperations();
+
+      const started = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() =>
+        expect(mockDownloader.enqueueDownload).toHaveBeenCalled(),
+      );
+      await act(() => operations.cancelDownload("item-1"));
+      expect(mockDownloader.cancelDownload).not.toHaveBeenCalled();
+      enqueue.release(7);
+      await act(() => started);
+
+      expect(mockDownloader.cancelDownload).toHaveBeenCalledWith(7);
+      expect(getPendingDownload("item-1")).toBeUndefined();
+      expect(fakeFiles.remaining()).toEqual([]);
+      expect(toast.success).not.toHaveBeenCalled();
+    });
+
+    it("takes a download native queued while it was being cancelled back out", async () => {
+      const enqueue = hold<number>();
+      mockDownloader.enqueueDownload.mockReturnValue(enqueue.promise);
+      const { operations } = await renderOperations();
+
+      const started = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() =>
+        expect(mockDownloader.enqueueDownload).toHaveBeenCalled(),
+      );
+      await act(() => operations.cancelDownload("item-1"));
+      mockDownloader.cancelQueuedDownload.mockClear();
+      // -1 is what native answers when the download waits behind another one.
+      enqueue.release(-1);
+      await act(() => started);
+
+      expect(mockDownloader.cancelQueuedDownload).toHaveBeenCalledWith(url);
+      expect(getPendingDownload("item-1")).toBeUndefined();
+    });
+
+    // The cancelled start only notices once its staging step returns. Its cleanup used to run
+    // then, and took the subtitles and trickplay sheets a new start of the item had reused.
+    it("leaves the files of a new start of the item alone", async () => {
+      const cancelledStaging = hold<undefined>();
+      const nextStaging = hold<undefined>();
+      mockBuildDownloadActivityMetadata
+        .mockReturnValueOnce(cancelledStaging.promise)
+        .mockReturnValueOnce(nextStaging.promise);
+      const { operations, setProcesses } = await renderOperations();
+
+      const cancelled = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() => expect(setProcesses).toHaveBeenCalledTimes(1));
+      await act(() => operations.cancelDownload("item-1"));
+      expect(fakeFiles.remaining()).toEqual([]);
+
+      const next = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() => expect(setProcesses).toHaveBeenCalledTimes(2));
+      cancelledStaging.release(undefined);
+      await act(() => cancelled);
+      nextStaging.release(undefined);
+      await act(() => next);
+
+      expect(mockDownloader.enqueueDownload).toHaveBeenCalledTimes(1);
+      expect(getPendingDownload("item-1")).toMatchObject({ taskId: 7 });
+      expect(fakeFiles.remaining()).toEqual(SIDECARS);
+    });
+
+    // The user cancelled and was told so. A start that fails after that is not a failed start.
+    it("does not report a failure when native refuses the cancelled download", async () => {
+      let refuse!: (error: Error) => void;
+      mockDownloader.enqueueDownload.mockReturnValue(
+        new Promise<number>((_resolve, reject) => {
+          refuse = reject;
+        }),
+      );
+      const { operations } = await renderOperations();
+
+      const started = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() =>
+        expect(mockDownloader.enqueueDownload).toHaveBeenCalled(),
+      );
+      await act(() => operations.cancelDownload("item-1"));
+      refuse(new Error("no session"));
+
+      await expect(act(() => started)).resolves.not.toThrow();
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(fakeFiles.remaining()).toEqual([]);
+    });
+
+    it("does not hold the cancel against the next download of the item", async () => {
+      const staging = hold<undefined>();
+      mockBuildDownloadActivityMetadata.mockReturnValueOnce(staging.promise);
+      const { operations, setProcesses } = await renderOperations();
+      const started = operations.startBackgroundDownload(
+        url,
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+      await waitFor(() => expect(setProcesses).toHaveBeenCalled());
+      await act(() => operations.cancelDownload("item-1"));
+      staging.release(undefined);
+      await act(() => started);
+
+      await act(() =>
+        operations.startBackgroundDownload(url, item, mediaSource, maxBitrate),
+      );
+
+      expect(mockDownloader.enqueueDownload).toHaveBeenCalledTimes(1);
+      expect(getPendingDownload("item-1")).toMatchObject({ taskId: 7 });
+      expect(fakeFiles.remaining()).toEqual(SIDECARS);
+    });
+  });
+});
+
+describe("startBackgroundDownload", () => {
+  const start = async () => {
+    const { operations } = await renderOperations();
+    let failure: unknown;
+    await act(async () => {
+      try {
+        await operations.startBackgroundDownload(
+          url,
+          item,
+          mediaSource,
+          maxBitrate,
+        );
+      } catch (error) {
+        failure = error;
+      }
+    });
+    return failure;
+  };
+
+  // A release build's console goes to logcat, where a log copied into an issue would hand out the
+  // session's token with the download URL.
+  it("logs the download URL without its ApiKey", async () => {
+    const { operations } = await renderOperations();
+
+    await act(async () => {
+      await operations.startBackgroundDownload(
+        "/Items/item-1/Download?ApiKey=SECRET_TOKEN",
+        item,
+        mediaSource,
+        maxBitrate,
+      );
+    });
+
+    const logged = jest.mocked(console.log).mock.calls.flat().join(" ");
+    expect(logged).toContain("https://jellyfin.example/Items/item-1/Download");
+    expect(logged).not.toContain("SECRET_TOKEN");
+  });
+
+  it("removes what it wrote when native refuses the download", async () => {
+    mockDownloader.enqueueDownload.mockRejectedValue(new Error("no session"));
+
+    expect(await start()).toEqual(new Error("no session"));
+
+    expect(getPendingDownload("item-1")).toBeUndefined();
+    expect(fakeFiles.remaining()).toEqual([]);
+  });
+
+  // The pending record is only saved once every sidecar is in place, so a failure before that
+  // has no record to say what was written.
+  it("removes what it wrote when it fails before the record is saved", async () => {
+    mockDownloadAdditionalAssets.mockImplementation(async () => {
+      writeSidecars();
+      throw new Error("disk full");
+    });
+
+    expect(await start()).toEqual(new Error("disk full"));
+
+    expect(mockDownloader.enqueueDownload).not.toHaveBeenCalled();
+    expect(fakeFiles.remaining()).toEqual([]);
+  });
+
+  // Until its assets are written a start has neither a card nor a pending record, so a second
+  // start of the item got through. A cancel then only reached one of the two, and the other
+  // enqueued a download that ran with no card.
+  it("refuses a second start of an item that is still being prepared", async () => {
+    const assets = hold<ReturnType<typeof writeSidecars>>();
+    mockDownloadAdditionalAssets.mockReturnValueOnce(assets.promise);
+    const { operations, setProcesses } = await renderOperations();
+
+    const first = operations.startBackgroundDownload(
+      url,
+      item,
+      mediaSource,
+      maxBitrate,
+    );
+    await waitFor(() =>
+      expect(mockDownloadAdditionalAssets).toHaveBeenCalled(),
+    );
+    await act(() =>
+      operations.startBackgroundDownload(url, item, mediaSource, maxBitrate),
+    );
+    expect(toast.info).toHaveBeenCalledWith(
+      "home.downloads.toasts.item_already_downloading",
+    );
+
+    assets.release(writeSidecars());
+    await act(() => first);
+
+    expect(mockDownloadAdditionalAssets).toHaveBeenCalledTimes(1);
+    const jobs = setProcesses.mock.calls.reduce(
+      (jobs, [update]) => update(jobs),
+      [],
+    );
+    expect(jobs).toEqual([
+      expect.objectContaining({ id: "item-1", status: "downloading" }),
+    ]);
+    expect(mockDownloader.enqueueDownload).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a file marked as queued until native starts it", async () => {
+    mockDownloader.enqueueDownload.mockResolvedValueOnce(-1);
+    const { operations, setProcesses } = await renderOperations();
+
+    await act(() =>
+      operations.startBackgroundDownload(url, item, mediaSource, maxBitrate),
+    );
+
+    const jobs = setProcesses.mock.calls.reduce(
+      (jobs, [update]) => update(jobs),
+      [],
+    );
+    expect(jobs).toEqual([
+      expect.objectContaining({ id: "item-1", status: "queued" }),
+    ]);
+    expect(toast.success).toHaveBeenCalledWith(
+      "home.downloads.toasts.download_queued_for_item",
+      { id: getDownloadToastId("item-1") },
+    );
+  });
+
+  // For item types other than Movie and Episode the video is named after the Jellyfin item id,
+  // which the server chooses: a separator in it used to put the video outside Documents.
+  it("hands native a path directly in Documents for an item whose id has a separator", async () => {
+    const hostile: BaseItemDto = { Id: "../escape", Type: "Video" };
+    const { operations } = await renderOperations();
+
+    await act(() =>
+      operations.startBackgroundDownload(url, hostile, mediaSource, {
+        key: "Max",
+        value: undefined,
+      }),
+    );
+
+    expect(mockDownloader.enqueueDownload.mock.calls[0][1]).toBe(
+      "/documents/___escape.mp4",
+    );
+    expect(getPendingDownload("../escape")?.videoFileName).toBe(
+      "___escape.mp4",
+    );
+  });
+
+  // A download that fails right away put its failure under the toast that said it started, and
+  // the two overlapped: the failure takes that toast's place, by its id.
+  // Native can report a failure before enqueueDownload's answer comes back: the error handler
+  // then removed the record and put the reason under the item's toast id, which a "started"
+  // toast would take over.
+  it("does not say a download started once it has failed", async () => {
+    mockDownloader.enqueueDownload.mockImplementationOnce(async () => {
+      removePendingDownload("item-1");
+      return 7;
+    });
+    const { operations } = await renderOperations();
+
+    await act(() =>
+      operations.startBackgroundDownload(url, item, mediaSource, maxBitrate),
+    );
+
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("names the toast that says the download started after the item", async () => {
+    const { operations } = await renderOperations();
+
+    await act(() =>
+      operations.startBackgroundDownload(url, item, mediaSource, maxBitrate),
+    );
+
+    expect(toast.success).toHaveBeenCalledWith(
+      "home.downloads.toasts.download_started_for_item",
+      { id: getDownloadToastId("item-1") },
+    );
+  });
+
+  it("leaves a download of the same item that is already in flight alone", async () => {
+    fakeFiles.add(...SIDECARS);
+    savePendingDownload({
+      itemId: "item-1",
+      status: "downloading",
+      enqueuedAt: "2026-10-04T12:00:00.000Z",
+      inputUrl: url,
+      videoFileName: "show_s01e01.mp4",
+      item,
+      mediaSource,
+      maxBitrate: { key: "Max", value: undefined },
+      deviceId: "device-1",
+    });
+
+    expect(await start()).toBeUndefined();
+
+    expect(mockDownloadAdditionalAssets).not.toHaveBeenCalled();
+    expect(fakeFiles.deleted()).toEqual([]);
+  });
+});
+
+describe("appSizeUsage", () => {
+  // Storage settings draw their bar from this: the volume downloads are
+  // written to, and how much of it the app's downloads take.
+  it("reports the size and free space of the volume downloads go to", async () => {
+    const { operations } = await renderOperations();
+
+    expect(await operations.appSizeUsage()).toEqual({
+      total: DISK_TOTAL,
+      remaining: DISK_AVAILABLE,
+      appSize: 0,
+    });
+  });
+});

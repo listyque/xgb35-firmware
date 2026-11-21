@@ -1,0 +1,17 @@
+#!/bin/sh
+echo '=== Kernel ==='
+uname -a
+echo '=== Boot arguments ==='
+cat /proc/cmdline
+echo '=== CPU ==='
+cat /proc/cpuinfo
+echo '=== Memory ==='
+head -n 12 /proc/meminfo
+echo '=== Mounted filesystems ==='
+cat /proc/mounts
+echo '=== Loaded modules ==='
+cat /proc/modules
+echo '=== Block devices (no mounts requested) ==='
+cat /proc/partitions
+echo '=== Recent kernel messages ==='
+dmesg | tail -n 80

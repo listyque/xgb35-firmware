@@ -1,0 +1,852 @@
+import * as Crypto from "expo-crypto";
+import * as SecureStore from "expo-secure-store";
+import {
+  bumpCustomHeadersVersion,
+  deleteSecureCustomHeaderValues,
+  recreateLegacySecureValues,
+  resolveCustomHeaderValues,
+  secureCustomHeaderMetadata,
+} from "./customHeaders/secureValues";
+import type { CustomHeader } from "./customHeaders/types";
+import { logAndCaptureError } from "./log";
+import { storage } from "./mmkv";
+import {
+  deleteSeerrPassword,
+  getSeerrPassword,
+  saveSeerrPassword,
+} from "./seerrPassword";
+
+const CREDENTIAL_KEY_PREFIX = "credential_";
+const MULTI_ACCOUNT_MIGRATED_KEY = "multiAccountMigrated";
+
+/**
+ * Security type for saved accounts.
+ */
+export type AccountSecurityType = "none" | "pin" | "password";
+
+/**
+ * Credential stored in secure storage for a specific account.
+ */
+export interface ServerCredential {
+  serverUrl: string;
+  serverName: string;
+  token: string;
+  userId: string;
+  username: string;
+  savedAt: number;
+  securityType: AccountSecurityType;
+  pinHash?: string;
+  primaryImageTag?: string;
+}
+
+/**
+ * Account summary stored in SavedServer for display in UI.
+ */
+export interface SavedServerAccount {
+  userId: string;
+  username: string;
+  securityType: AccountSecurityType;
+  savedAt: number;
+  primaryImageTag?: string;
+}
+
+/**
+ * Local network configuration for automatic URL switching.
+ */
+export interface LocalNetworkConfig {
+  localUrl: string;
+  homeWifiSSIDs: string[];
+  enabled: boolean;
+}
+
+/**
+ * Server with multiple saved accounts.
+ */
+export interface SavedServer {
+  address: string;
+  name?: string;
+  accounts: SavedServerAccount[];
+  localNetworkConfig?: LocalNetworkConfig;
+  /** Proxy auth headers for this server; values live in SecureStore. */
+  customHeaders?: CustomHeader[];
+}
+
+/**
+ * Legacy interface for migration purposes.
+ */
+interface LegacySavedServer {
+  address: string;
+  name?: string;
+  hasCredentials?: boolean;
+  username?: string;
+}
+
+/**
+ * Legacy credential interface for migration purposes.
+ */
+interface LegacyServerCredential {
+  serverUrl: string;
+  serverName: string;
+  token: string;
+  userId: string;
+  username: string;
+  savedAt: number;
+}
+
+/**
+ * Encode server URL to valid secure store key (legacy, for migration).
+ */
+export function serverUrlToKey(serverUrl: string): string {
+  const encoded = btoa(serverUrl).replace(/[^a-zA-Z0-9]/g, "_");
+  return `${CREDENTIAL_KEY_PREFIX}${encoded}`;
+}
+
+/**
+ * Generate credential key for a specific account (serverUrl + userId).
+ */
+export function credentialKey(serverUrl: string, userId: string): string {
+  const combined = `${serverUrl}:${userId}`;
+  const encoded = btoa(combined).replace(/[^a-zA-Z0-9]/g, "_");
+  return `${CREDENTIAL_KEY_PREFIX}${encoded}`;
+}
+
+/**
+ * Hash a PIN using SHA256.
+ */
+export async function hashPIN(pin: string): Promise<string> {
+  return await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    pin,
+  );
+}
+
+/**
+ * Verify a PIN against stored hash.
+ */
+export async function verifyAccountPIN(
+  serverUrl: string,
+  userId: string,
+  pin: string,
+): Promise<boolean> {
+  const credential = await getAccountCredential(serverUrl, userId);
+  if (!credential?.pinHash) return false;
+  const inputHash = await hashPIN(pin);
+  return inputHash === credential.pinHash;
+}
+
+/**
+ * Save credential for a specific account.
+ */
+export async function saveAccountCredential(
+  credential: ServerCredential,
+): Promise<void> {
+  const key = credentialKey(credential.serverUrl, credential.userId);
+  await SecureStore.setItemAsync(key, JSON.stringify(credential));
+
+  // Update previousServers to include this account
+  addAccountToServer(credential.serverUrl, credential.serverName, {
+    userId: credential.userId,
+    username: credential.username,
+    securityType: credential.securityType,
+    savedAt: credential.savedAt,
+    primaryImageTag: credential.primaryImageTag,
+  });
+}
+
+/**
+ * Retrieve credential for a specific account.
+ */
+export async function getAccountCredential(
+  serverUrl: string,
+  userId: string,
+): Promise<ServerCredential | null> {
+  const key = credentialKey(serverUrl, userId);
+  const stored = await SecureStore.getItemAsync(key);
+
+  if (stored) {
+    try {
+      return JSON.parse(stored) as ServerCredential;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The credential a saved account signs in with, or null once an account that
+ * has none is forgotten.
+ *
+ * The account list and the credentials are two stores, and an account can be
+ * listed with no credential behind it (REACT-NATIVE-2K, on tvOS). Such an
+ * entry can never sign in, so it comes off the list the way an account whose
+ * token was rejected does, and signing in again puts it back.
+ */
+export async function getCredentialOrForgetAccount(
+  serverUrl: string,
+  userId: string,
+): Promise<ServerCredential | null> {
+  const credential = await getAccountCredential(serverUrl, userId);
+  if (credential) return credential;
+  await deleteAccountCredential(serverUrl, userId);
+  return null;
+}
+
+/**
+ * Delete credential for a specific account.
+ */
+export async function deleteAccountCredential(
+  serverUrl: string,
+  userId: string,
+): Promise<void> {
+  const key = credentialKey(serverUrl, userId);
+  await SecureStore.deleteItemAsync(key);
+
+  // Forgetting the account also forgets its Seerr password: it must
+  // not outlive the credential it belongs to.
+  await deleteSeerrPassword(serverUrl, userId);
+
+  // Remove account from previousServers
+  removeAccountFromServer(serverUrl, userId);
+}
+
+/**
+ * Get all credentials for a server (by iterating through accounts).
+ */
+export async function getServerAccounts(
+  serverUrl: string,
+): Promise<ServerCredential[]> {
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+  if (!server) return [];
+
+  const credentials: ServerCredential[] = [];
+  for (const account of server.accounts) {
+    const credential = await getAccountCredential(serverUrl, account.userId);
+    if (credential) {
+      credentials.push(credential);
+    }
+  }
+  return credentials;
+}
+
+/**
+ * Check if credentials exist for a specific account.
+ */
+export async function hasAccountCredential(
+  serverUrl: string,
+  userId: string,
+): Promise<boolean> {
+  const key = credentialKey(serverUrl, userId);
+  const stored = await SecureStore.getItemAsync(key);
+  return stored !== null;
+}
+
+/**
+ * Add or update an account in a server's accounts list.
+ */
+export function addAccountToServer(
+  serverUrl: string,
+  serverName: string,
+  account: SavedServerAccount,
+): void {
+  const previousServers = getPreviousServers();
+  let serverFound = false;
+
+  const updatedServers = previousServers.map((server) => {
+    if (server.address === serverUrl) {
+      serverFound = true;
+      // Check if account already exists
+      const existingIndex = server.accounts.findIndex(
+        (a) => a.userId === account.userId,
+      );
+      if (existingIndex >= 0) {
+        // Update existing account
+        const updatedAccounts = [...server.accounts];
+        updatedAccounts[existingIndex] = account;
+        return {
+          ...server,
+          name: serverName || server.name,
+          accounts: updatedAccounts,
+        };
+      }
+      // Add new account
+      return {
+        ...server,
+        name: serverName || server.name,
+        accounts: [...server.accounts, account],
+      };
+    }
+    return server;
+  });
+
+  // If server not found, add it
+  if (!serverFound) {
+    updatedServers.push({
+      address: serverUrl,
+      name: serverName,
+      accounts: [account],
+    });
+  }
+
+  storage.set("previousServers", JSON.stringify(updatedServers));
+}
+
+/**
+ * Remove an account from a server's accounts list.
+ */
+function removeAccountFromServer(serverUrl: string, userId: string): void {
+  const previousServers = getPreviousServers();
+
+  const updatedServers = previousServers.map((server) => {
+    if (server.address === serverUrl) {
+      return {
+        ...server,
+        accounts: server.accounts.filter((a) => a.userId !== userId),
+      };
+    }
+    return server;
+  });
+
+  storage.set("previousServers", JSON.stringify(updatedServers));
+}
+
+/**
+ * Get previous servers list from MMKV.
+ */
+export function getPreviousServers(): SavedServer[] {
+  const stored = storage.getString("previousServers");
+  if (stored) {
+    try {
+      return JSON.parse(stored) as SavedServer[];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/**
+ * Remove a server from the list and delete all its account credentials.
+ */
+export async function removeServerFromList(serverUrl: string): Promise<void> {
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+
+  // Delete all account credentials for this server
+  if (server) {
+    for (const account of server.accounts) {
+      const key = credentialKey(serverUrl, account.userId);
+      await SecureStore.deleteItemAsync(key);
+    }
+    deleteSecureCustomHeaderValues(server.customHeaders ?? []);
+  }
+
+  // Remove server from list
+  const filtered = servers.filter((s) => s.address !== serverUrl);
+  storage.set("previousServers", JSON.stringify(filtered));
+  // The header values are gone; anything caching them has to re-read.
+  bumpCustomHeadersVersion();
+}
+
+/**
+ * Add a server to the list without credentials (for server discovery).
+ */
+export function addServerToList(serverUrl: string, serverName?: string): void {
+  const servers = getPreviousServers();
+  const existing = servers.find((s) => s.address === serverUrl);
+
+  if (existing) {
+    // Update name if provided
+    if (serverName) {
+      const updated = servers.map((s) =>
+        s.address === serverUrl ? { ...s, name: serverName } : s,
+      );
+      storage.set("previousServers", JSON.stringify(updated));
+    }
+    return;
+  }
+
+  // Add new server with empty accounts
+  const newServer: SavedServer = {
+    address: serverUrl,
+    name: serverName,
+    accounts: [],
+  };
+
+  // Keep max 10 servers
+  const updatedServers = [newServer, ...servers].slice(0, 10);
+  storage.set("previousServers", JSON.stringify(updatedServers));
+}
+
+/**
+ * Update local network configuration for a server.
+ */
+export function updateServerLocalConfig(
+  serverUrl: string,
+  config: LocalNetworkConfig | undefined,
+): void {
+  const servers = getPreviousServers();
+  const updatedServers = servers.map((server) => {
+    if (server.address === serverUrl) {
+      return {
+        ...server,
+        localNetworkConfig: config,
+      };
+    }
+    return server;
+  });
+  storage.set("previousServers", JSON.stringify(updatedServers));
+}
+
+/**
+ * Get local network configuration for a server.
+ */
+export function getServerLocalConfig(
+  serverUrl: string,
+): LocalNetworkConfig | undefined {
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+  return server?.localNetworkConfig;
+}
+
+/**
+ * Replace the custom proxy headers for a server. Values are moved into
+ * SecureStore; only their names and SecureStore keys reach MMKV.
+ *
+ * The server entry is created if it doesn't exist yet — headers are configured
+ * during login, before the server has any accounts.
+ */
+export function updateServerCustomHeaders(
+  serverUrl: string,
+  headers: CustomHeader[],
+): void {
+  const servers = getPreviousServers();
+  const existingIndex = servers.findIndex((s) => s.address === serverUrl);
+  const previousHeaders =
+    existingIndex >= 0 ? (servers[existingIndex].customHeaders ?? []) : [];
+
+  // `headers` carries the values as typed; re-reading them from SecureStore
+  // here would hand back the previous secret and silently discard the edit.
+  const customHeaders = secureCustomHeaderMetadata(
+    `server:${serverUrl}`,
+    headers,
+    previousHeaders,
+  );
+
+  if (existingIndex >= 0) {
+    servers[existingIndex] = { ...servers[existingIndex], customHeaders };
+  } else {
+    // Same placement and cap as addServerToList — headers are configured before
+    // the connection succeeds, so this can be what creates the entry.
+    servers.unshift({ address: serverUrl, accounts: [], customHeaders });
+    servers.splice(10);
+  }
+
+  storage.set("previousServers", JSON.stringify(servers));
+  bumpCustomHeadersVersion();
+}
+
+/**
+ * Custom proxy headers for a server, with their SecureStore values filled in.
+ */
+export function getServerCustomHeaders(serverUrl: string): CustomHeader[] {
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+  // This is a read: it must not write, because it runs during render (every
+  // <Image> resolves its headers through it).
+  return resolveCustomHeaderValues(server?.customHeaders ?? []);
+}
+
+/**
+ * The one credential an account keeps when it is saved under both addresses:
+ * the fresher token, since the account signed in with it since, and the
+ * stricter protection. A move must never be what takes a PIN or a password
+ * prompt off an account, whichever address it was set under.
+ */
+function mergeCredentials(
+  moving: ServerCredential,
+  present: ServerCredential | null,
+  to: string,
+): ServerCredential {
+  if (!present) return { ...moving, serverUrl: to };
+
+  const [fresher, other] =
+    present.savedAt < moving.savedAt ? [moving, present] : [present, moving];
+  const guard =
+    fresher.securityType === "none" && other.securityType !== "none"
+      ? other
+      : fresher;
+  return {
+    ...fresher,
+    serverUrl: to,
+    securityType: guard.securityType,
+    pinHash: guard.pinHash,
+  };
+}
+
+/**
+ * Copies what the keychain holds for one account to another server address:
+ * its credential, PIN or password protection included, and its Seerr
+ * password. Nothing is taken from the old address here: until the list names
+ * the new one, the old one is what a saved login is looked up under.
+ *
+ * Resolves to the credential the account has at the new address afterwards,
+ * or to null when it has none.
+ */
+async function copyAccountSecrets(
+  from: string,
+  to: string,
+  userId: string,
+): Promise<ServerCredential | null> {
+  const moving = await getAccountCredential(from, userId);
+  let kept = await getAccountCredential(to, userId);
+  if (moving) {
+    kept = mergeCredentials(moving, kept, to);
+    await SecureStore.setItemAsync(
+      credentialKey(to, userId),
+      JSON.stringify(kept),
+    );
+  }
+
+  const password = await getSeerrPassword(from, userId);
+  if (password !== null && (await getSeerrPassword(to, userId)) === null) {
+    await saveSeerrPassword(to, userId, password);
+  }
+  return kept;
+}
+
+/**
+ * Removes what `copyAccountSecrets` left under the old address. What cannot
+ * be removed stays behind as an item nothing reads any more, so a keychain
+ * that refuses here does not undo a move that is already done.
+ */
+async function removeAccountSecrets(
+  from: string,
+  userId: string,
+): Promise<void> {
+  await Promise.allSettled([
+    SecureStore.deleteItemAsync(credentialKey(from, userId)),
+    deleteSeerrPassword(from, userId),
+  ]);
+}
+
+/**
+ * One entry per user, the more recently saved one when both lists have it.
+ *
+ * The list is what the sign-in screen reads to decide whether to ask for a
+ * PIN or a password, and the credential is what it then signs in with. So an
+ * entry takes its protection from the credential the account ended up with:
+ * the two must not disagree, or the prompt could be skipped for a credential
+ * that asks for one.
+ */
+function mergeAccounts(
+  moved: SavedServerAccount[],
+  present: SavedServerAccount[],
+  credentials: Map<string, ServerCredential>,
+): SavedServerAccount[] {
+  const byUser = new Map(present.map((account) => [account.userId, account]));
+  for (const account of moved) {
+    const existing = byUser.get(account.userId);
+    if (!existing || existing.savedAt < account.savedAt) {
+      byUser.set(account.userId, account);
+    }
+  }
+  return [...byUser.values()].map((account) => {
+    const credential = credentials.get(account.userId);
+    return credential
+      ? { ...account, securityType: credential.securityType }
+      : account;
+  });
+}
+
+/**
+ * Moves a saved server to another address, for an address that turned out to
+ * be another spelling of the same server: its accounts and what the keychain
+ * holds for them, its local network configuration and its custom headers.
+ *
+ * Whatever is already saved under the new address stays, and the two are
+ * merged. Everything is copied first, then the list is written, and only then
+ * is the old address emptied. A run that fails or is cut short before the
+ * list is written leaves the old entry listed with all it had, so a saved
+ * login still works under it and the next run does the move again.
+ */
+export async function renameSavedServer(
+  from: string,
+  to: string,
+): Promise<void> {
+  if (from === to) return;
+  const source = getPreviousServers().find((s) => s.address === from);
+  if (!source) return;
+
+  const credentials = new Map<string, ServerCredential>();
+  for (const account of source.accounts) {
+    const kept = await copyAccountSecrets(from, to, account.userId);
+    if (kept) credentials.set(account.userId, kept);
+  }
+
+  // The header values are stored under keys made from the address, so they
+  // are written again under the new one rather than pointed at.
+  const sourceHeaders = getServerCustomHeaders(from);
+  if (sourceHeaders.length > 0 && getServerCustomHeaders(to).length === 0) {
+    updateServerCustomHeaders(to, sourceHeaders);
+  }
+
+  const servers = getPreviousServers();
+  const target = servers.find((s) => s.address === to);
+  const merged: SavedServer = {
+    address: to,
+    name: target?.name ?? source.name,
+    accounts: mergeAccounts(
+      source.accounts,
+      target?.accounts ?? [],
+      credentials,
+    ),
+    localNetworkConfig: target?.localNetworkConfig ?? source.localNetworkConfig,
+    customHeaders: target?.customHeaders,
+  };
+  // In the place of the old entry, so the list keeps its order.
+  const updated = servers.flatMap((server) => {
+    if (server.address === from) return [merged];
+    return server.address === to ? [] : [server];
+  });
+  storage.set("previousServers", JSON.stringify(updated));
+
+  for (const account of source.accounts) {
+    await removeAccountSecrets(from, account.userId);
+  }
+  deleteSecureCustomHeaderValues(source.customHeaders ?? []);
+  bumpCustomHeadersVersion();
+}
+
+/**
+ * Moves the header values an earlier build stored to items that can be read
+ * while the phone is locked: see `recreateLegacySecureValues`. Run at startup.
+ * It does nothing once every value is moved, and nothing on a locked phone,
+ * where the next launch tries again.
+ */
+export function makeServerHeadersReadableWhileLocked(): void {
+  try {
+    const replaced: CustomHeader[] = [];
+    const servers = getPreviousServers().map((server) => {
+      const moved = recreateLegacySecureValues(
+        `server:${server.address}`,
+        server.customHeaders ?? [],
+      );
+      if (!moved) return server;
+
+      replaced.push(...moved.replaced);
+      return { ...server, customHeaders: moved.headers };
+    });
+    if (replaced.length === 0) return;
+
+    storage.set("previousServers", JSON.stringify(servers));
+    deleteSecureCustomHeaderValues(replaced);
+  } catch (error) {
+    logAndCaptureError("Moving the server header values failed", error);
+  }
+}
+
+/**
+ * Migrate from legacy single-account format to multi-account format.
+ * Should be called on app startup.
+ */
+export async function migrateToMultiAccount(): Promise<void> {
+  // Check if already migrated
+  if (storage.getBoolean(MULTI_ACCOUNT_MIGRATED_KEY)) {
+    return;
+  }
+
+  const stored = storage.getString("previousServers");
+  if (!stored) {
+    storage.set(MULTI_ACCOUNT_MIGRATED_KEY, true);
+    return;
+  }
+
+  try {
+    const servers = JSON.parse(stored);
+
+    // Check if already in new format (has accounts array)
+    if (servers.length > 0 && Array.isArray(servers[0].accounts)) {
+      storage.set(MULTI_ACCOUNT_MIGRATED_KEY, true);
+      return;
+    }
+
+    // Migrate from legacy format
+    const migratedServers: SavedServer[] = [];
+
+    for (const legacyServer of servers as LegacySavedServer[]) {
+      const newServer: SavedServer = {
+        address: legacyServer.address,
+        name: legacyServer.name,
+        accounts: [],
+      };
+
+      // Try to get existing credential using legacy key
+      if (legacyServer.hasCredentials) {
+        const legacyKey = serverUrlToKey(legacyServer.address);
+        const storedCred = await SecureStore.getItemAsync(legacyKey);
+
+        if (storedCred) {
+          try {
+            const legacyCred = JSON.parse(storedCred) as LegacyServerCredential;
+
+            // Create new credential with security type
+            const newCredential: ServerCredential = {
+              ...legacyCred,
+              securityType: "none", // Existing accounts get no protection (preserve quick-login)
+            };
+
+            // Save with new key format
+            const newKey = credentialKey(
+              legacyServer.address,
+              legacyCred.userId,
+            );
+            await SecureStore.setItemAsync(
+              newKey,
+              JSON.stringify(newCredential),
+            );
+
+            // Delete old key
+            await SecureStore.deleteItemAsync(legacyKey);
+
+            // Add account to server
+            newServer.accounts.push({
+              userId: legacyCred.userId,
+              username: legacyCred.username,
+              securityType: "none",
+              savedAt: legacyCred.savedAt,
+            });
+          } catch {
+            // Skip invalid credentials
+          }
+        }
+      }
+
+      migratedServers.push(newServer);
+    }
+
+    storage.set("previousServers", JSON.stringify(migratedServers));
+    storage.set(MULTI_ACCOUNT_MIGRATED_KEY, true);
+  } catch (error) {
+    // If parsing fails, reset to empty array. This destroys the user's saved
+    // server list, so it must never happen silently.
+    logAndCaptureError(
+      "Saved-servers migration failed; resetting previousServers",
+      error,
+    );
+    storage.set("previousServers", "[]");
+    storage.set(MULTI_ACCOUNT_MIGRATED_KEY, true);
+  }
+}
+
+/**
+ * Update account's token and optionally other fields after successful login.
+ */
+export async function updateAccountToken(
+  serverUrl: string,
+  userId: string,
+  newToken: string,
+  primaryImageTag?: string,
+): Promise<void> {
+  const credential = await getAccountCredential(serverUrl, userId);
+  if (credential) {
+    credential.token = newToken;
+    credential.savedAt = Date.now();
+    if (primaryImageTag !== undefined) {
+      credential.primaryImageTag = primaryImageTag;
+    }
+    const key = credentialKey(serverUrl, userId);
+    await SecureStore.setItemAsync(key, JSON.stringify(credential));
+
+    // Also update the account info in the server list
+    addAccountToServer(serverUrl, credential.serverName, {
+      userId: credential.userId,
+      username: credential.username,
+      securityType: credential.securityType,
+      savedAt: credential.savedAt,
+      primaryImageTag: credential.primaryImageTag,
+    });
+  }
+}
+
+// Legacy functions for backward compatibility during transition
+// These delegate to new functions
+
+/**
+ * @deprecated Use saveAccountCredential instead
+ */
+export async function saveServerCredential(
+  credential: ServerCredential,
+): Promise<void> {
+  return saveAccountCredential(credential);
+}
+
+/**
+ * @deprecated Use getAccountCredential instead
+ */
+export async function getServerCredential(
+  serverUrl: string,
+): Promise<ServerCredential | null> {
+  // Try to get first account's credential for backward compatibility
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+  if (server && server.accounts.length > 0) {
+    return getAccountCredential(serverUrl, server.accounts[0].userId);
+  }
+  return null;
+}
+
+/**
+ * @deprecated Use deleteAccountCredential instead
+ */
+export async function deleteServerCredential(serverUrl: string): Promise<void> {
+  // Delete first account for backward compatibility
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+  if (server && server.accounts.length > 0) {
+    return deleteAccountCredential(serverUrl, server.accounts[0].userId);
+  }
+}
+
+/**
+ * @deprecated Use hasAccountCredential instead
+ */
+export async function hasServerCredential(serverUrl: string): Promise<boolean> {
+  const servers = getPreviousServers();
+  const server = servers.find((s) => s.address === serverUrl);
+  return server ? server.accounts.length > 0 : false;
+}
+
+/**
+ * @deprecated Use migrateToMultiAccount instead
+ */
+export async function migrateServersList(): Promise<void> {
+  return migrateToMultiAccount();
+}
+
+/**
+ * @deprecated Use saveAccountCredential instead
+ */
+export async function migrateCurrentSessionToSecureStorage(
+  serverUrl: string,
+  token: string,
+  userId: string,
+  username: string,
+  serverName?: string,
+): Promise<void> {
+  const existingCredential = await getAccountCredential(serverUrl, userId);
+
+  // Only save if not already saved
+  if (!existingCredential) {
+    await saveAccountCredential({
+      serverUrl,
+      serverName: serverName || "",
+      token,
+      userId,
+      username,
+      savedAt: Date.now(),
+      securityType: "none",
+    });
+  }
+}

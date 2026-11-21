@@ -1,0 +1,308 @@
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models";
+import { getShowApi } from "@jellyfin/sdk/lib/utils/api";
+import { useQuery } from "@tanstack/react-query";
+import { atom, useAtom } from "jotai";
+import { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { View } from "react-native";
+import {
+  SeasonDropdown,
+  type SeasonIndexState,
+} from "@/components/series/SeasonDropdown";
+import { SyncPlayQueueButton } from "@/components/syncplay/SyncPlayQueueButton";
+import { useEpisodeAirLabels } from "@/hooks/useEpisodeAirLabels";
+import { useDownload } from "@/providers/DownloadProvider";
+import { apiAtom, userAtom } from "@/providers/JellyfinProvider";
+import { useOfflineMode } from "@/providers/OfflineModeProvider";
+import {
+  buildOfflineSeasons,
+  downloadsKeyPart,
+  getDownloadedEpisodesForSeason,
+  keepThroughDownloadRefresh,
+} from "@/utils/downloads/offline-series";
+import {
+  findRememberedSeason,
+  replacementSeason,
+} from "@/utils/seasonSelection";
+import { runtimeTicksToSeconds } from "@/utils/time";
+import { buildItemCards, type CardData } from "../cards/CardData";
+import { CardListRow } from "../cards/CardListRow";
+import { CardPill } from "../cards/CardPill";
+import { useItemCardBehavior } from "../cards/useItemCardBehavior";
+import {
+  SeasonDownloadedIcon,
+  SeasonDownloadIcon,
+} from "../common/DownloadIcons";
+import { Text } from "../common/Text";
+import { DownloadItems, DownloadSingleItem } from "../DownloadItem";
+import { Loader } from "../Loader";
+import { PlayedStatus } from "../PlayedStatus";
+import { episodeRowState } from "./episodeRowState";
+
+type Props = {
+  item: BaseItemDto;
+  initialSeasonIndex?: number;
+};
+
+export const seasonIndexAtom = atom<SeasonIndexState>({});
+
+export const SeasonPicker: React.FC<Props> = ({ item, initialSeasonIndex }) => {
+  const [api] = useAtom(apiAtom);
+  const [user] = useAtom(userAtom);
+  const [seasonIndexState, setSeasonIndexState] = useAtom(seasonIndexAtom);
+  const { t } = useTranslation();
+  const isOffline = useOfflineMode();
+  const { getDownloadedItems, refreshKey } = useDownload();
+
+  const seasonIndex = useMemo(
+    () => seasonIndexState[item.Id ?? ""],
+    [item, seasonIndexState],
+  );
+
+  const seasonsKey = [
+    "seasons",
+    item.Id,
+    isOffline,
+    downloadsKeyPart(isOffline, refreshKey),
+  ];
+  const seasonsQuery = useQuery({
+    queryKey: seasonsKey,
+    placeholderData: keepThroughDownloadRefresh(seasonsKey),
+    queryFn: async () => {
+      if (isOffline) {
+        return buildOfflineSeasons(getDownloadedItems(), item.Id!);
+      }
+
+      if (!api || !user?.Id || !item.Id) return [];
+      const response = await getShowApi(api).getSeasons({
+        seriesId: item.Id,
+        userId: user.Id,
+        fields: [
+          "ItemCounts",
+          "PrimaryImageAspectRatio",
+          "CanDelete",
+          "MediaSourceCount",
+        ],
+      });
+
+      return response.data.Items || [];
+    },
+    staleTime: isOffline ? Infinity : 60,
+    enabled: isOffline || (!!api && !!user?.Id && !!item.Id),
+  });
+  const { data: seasons = [] } = seasonsQuery;
+
+  // The remembered season can go away under the page: offline, deleting its
+  // last downloaded episode removes it from the list. SeasonDropdown only
+  // picks a season while none is remembered, so without this the page stays
+  // on a season it can no longer show.
+  useEffect(() => {
+    if (!item.Id) return;
+    const replacement = replacementSeason(seasons, seasonIndex);
+    if (replacement === undefined) return;
+    setSeasonIndexState((prev) => ({ ...prev, [item.Id!]: replacement }));
+  }, [item.Id, seasons, seasonIndex, setSeasonIndexState]);
+
+  const selectedSeasonId: string | null = useMemo(
+    () => findRememberedSeason(seasons, seasonIndex)?.Id ?? null,
+    [seasons, seasonIndex],
+  );
+
+  // For offline mode, we use season index number instead of ID
+  const selectedSeasonNumber = useMemo(() => {
+    if (!isOffline) return null;
+    return findRememberedSeason(seasons, seasonIndex)?.IndexNumber ?? null;
+  }, [isOffline, seasons, seasonIndex]);
+
+  const episodesKey = [
+    "episodes",
+    item.Id,
+    isOffline ? selectedSeasonNumber : selectedSeasonId,
+    isOffline,
+    downloadsKeyPart(isOffline, refreshKey),
+  ];
+  const episodesQuery = useQuery({
+    queryKey: episodesKey,
+    placeholderData: keepThroughDownloadRefresh(episodesKey),
+    queryFn: async () => {
+      if (isOffline) {
+        return getDownloadedEpisodesForSeason(
+          getDownloadedItems(),
+          item.Id!,
+          selectedSeasonNumber!,
+        );
+      }
+
+      if (!api || !user?.Id || !item.Id || !selectedSeasonId) {
+        return [];
+      }
+
+      const res = await getShowApi(api).getEpisodes({
+        seriesId: item.Id,
+        userId: user.Id,
+        seasonId: selectedSeasonId,
+        enableUserData: true,
+        fields: ["MediaSources", "MediaStreams", "Overview", "Trickplay"],
+      });
+
+      if (res.data.TotalRecordCount === 0)
+        console.warn(
+          "No episodes found for season with ID ~",
+          selectedSeasonId,
+        );
+
+      return res.data.Items;
+    },
+    staleTime: isOffline ? Infinity : 0,
+    enabled: isOffline
+      ? !!item.Id && selectedSeasonNumber !== null
+      : !!api && !!user?.Id && !!item.Id && !!selectedSeasonId,
+  });
+  const { data: episodes } = episodesQuery;
+  // SeasonDropdown picks the default season in an effect, a render after the
+  // seasons arrive: until a season is on screen, its episodes are not asked for.
+  const awaitingSeason =
+    seasons.length > 0 &&
+    (isOffline ? selectedSeasonNumber === null : selectedSeasonId === null);
+  const episodeRow = episodeRowState(
+    seasonsQuery,
+    episodesQuery,
+    awaitingSeason,
+  );
+
+  // Used for height calculation
+  const [nrOfEpisodes, setNrOfEpisodes] = useState(0);
+  useEffect(() => {
+    if (episodes && episodes.length > 0) {
+      setNrOfEpisodes(episodes.length);
+    }
+  }, [episodes]);
+
+  const episodeById = useMemo(
+    () => new Map((episodes ?? []).map((e) => [e.Id, e])),
+    [episodes],
+  );
+
+  // The shared card, plus the runtime line a season list wants. Episodes here
+  // keep their own still rather than the series poster.
+  const episodeCards = useMemo(() => {
+    const base = buildItemCards(episodes ?? [], {
+      api,
+      kind: "rowWide",
+      useEpisodePoster: true,
+    });
+    return base.map((card) => ({
+      ...card,
+      detail: runtimeTicksToSeconds(episodeById.get(card.id)?.RunTimeTicks),
+    }));
+  }, [episodes, api, episodeById]);
+
+  const { cards, handlePress, handleLongPress, actionSheet } =
+    useItemCardBehavior({
+      items: episodes ?? [],
+      cards: episodeCards,
+      kind: "rowWide",
+      // The rows this replaced were TouchableItemRouters, which carried it.
+      enableActionSheet: true,
+    });
+
+  const { availabilityLabel } = useEpisodeAirLabels();
+  const slots = useMemo(
+    () => ({
+      // An episode the library has no file for says so, and offers no
+      // download, rather than looking like one that plays.
+      overlay: (card: CardData) => {
+        const label = availabilityLabel(episodeById.get(card.id));
+        return label ? <CardPill label={label} /> : null;
+      },
+      trailing: (card: CardData) => {
+        const episode = episodeById.get(card.id);
+        if (isOffline || !episode || availabilityLabel(episode)) return null;
+        return <DownloadSingleItem item={episode} />;
+      },
+      footer: (card: CardData) => {
+        const overview = episodeById.get(card.id)?.Overview;
+        if (!overview) return null;
+        return (
+          <Text numberOfLines={3} className='text-xs text-neutral-500 mt-2'>
+            {overview}
+          </Text>
+        );
+      },
+    }),
+    [episodeById, isOffline, availabilityLabel],
+  );
+
+  return (
+    <View
+      style={{
+        minHeight: 144 * nrOfEpisodes,
+      }}
+    >
+      <View className='flex flex-row justify-start items-center px-4'>
+        <SeasonDropdown
+          item={item}
+          seasons={seasons}
+          initialSeasonIndex={initialSeasonIndex}
+          state={seasonIndexState}
+          onSelect={(season) => {
+            if (!item.Id) return;
+            setSeasonIndexState((prev) => ({
+              ...prev,
+              [item.Id!]: season.IndexNumber ?? season.Name,
+            }));
+          }}
+        />
+        {episodes?.length && !isOffline ? (
+          <View className='flex flex-row items-center space-x-2'>
+            <DownloadItems
+              title={t("item_card.download.download_season")}
+              className='ml-2'
+              items={episodes || []}
+              MissingDownloadIconComponent={SeasonDownloadIcon}
+              DownloadedIconComponent={SeasonDownloadedIcon}
+            />
+            <PlayedStatus items={episodes || []} />
+            <SyncPlayQueueButton items={episodes || []} variant='icon' />
+          </View>
+        ) : null}
+      </View>
+      <View className='px-4 flex flex-col mt-4'>
+        {episodeRow === "loading" ? (
+          <View
+            testID='season-episodes-loading'
+            style={{
+              minHeight: 144 * nrOfEpisodes,
+            }}
+            className='flex flex-col items-center justify-center'
+          >
+            <Loader />
+          </View>
+        ) : (
+          cards.map((card) => (
+            <View key={card.id} className='mb-4'>
+              <CardListRow
+                card={card}
+                slots={slots}
+                onPress={() => handlePress(card.id)}
+                onLongPress={
+                  handleLongPress ? () => handleLongPress(card.id) : undefined
+                }
+              />
+            </View>
+          ))
+        )}
+        {episodeRow !== "loading" && (episodes?.length || 0) === 0 ? (
+          <View className='flex flex-col'>
+            <Text className='text-neutral-500'>
+              {episodeRow === "failed"
+                ? t("item_card.episodes_load_failed")
+                : t("item_card.no_episodes_for_this_season")}
+            </Text>
+          </View>
+        ) : null}
+      </View>
+      {actionSheet}
+    </View>
+  );
+};

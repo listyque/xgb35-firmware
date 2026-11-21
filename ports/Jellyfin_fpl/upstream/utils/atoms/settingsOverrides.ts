@@ -1,0 +1,268 @@
+/**
+ * How admin (Streamyfin plugin) settings combine with the user's own.
+ *
+ * The rule, in one line: **locked pins a value, unlocked only supplies a
+ * default.** An unlocked setting is one the admin left the user free to change,
+ * so it may seed storage once and must never win at read time.
+ *
+ * Kept free of runtime imports (types only) so the policy is unit-testable
+ * without dragging in i18n, the settings atom or React.
+ */
+import type { PluginLockableSettings, Settings } from "./settings";
+
+export type AppliedPluginDefaults = Partial<Record<keyof Settings, unknown>>;
+
+/** Coerce a raw plugin value into the shape a given setting expects. */
+export type NormalizePluginValue = (
+  key: keyof Settings,
+  value: unknown,
+) => unknown;
+
+export const hasMeaningfulSettingValue = (value: unknown): boolean =>
+  value !== undefined && value !== null && value !== "";
+
+// Settings whose values are secrets. They must never reach the app log, which
+// users read in-app and paste into bug reports.
+export const SENSITIVE_SETTING_KEYS: ReadonlySet<keyof Settings> = new Set([
+  "seerrApiKey",
+  "openSubtitlesApiKey",
+] as const);
+
+/**
+ * Settings an unlocked plugin default must never seed. Crash-report consent
+ * can only change by explicit user action (or an admin lock): the intro sheet
+ * is the opt-out surface and it is available before the first plugin sync
+ * happens at login, so a deferred seed would silently re-enable reporting
+ * over the user's explicit opt-out.
+ *
+ * Nor the secrets: the settings belong to the device, so a seeded key stayed
+ * for every account signed in after the one it was served to. They apply at
+ * read time instead, while the plugin serves them to whoever is signed in.
+ */
+const NEVER_SEED_KEYS: ReadonlySet<keyof Settings> = new Set([
+  "sentryEnabled",
+  ...SENSITIVE_SETTING_KEYS,
+]);
+
+/**
+ * Effective settings, in precedence order:
+ *
+ *   app defaults → unlocked plugin values (fallback only) → the user's stored
+ *   values → admin-**locked** plugin values (pinned on top)
+ *
+ * An unlocked plugin value may only *fill a gap*. It applies when the user has
+ * nothing meaningful of their own for that key — an admin-supplied server URL
+ * has to work before the user has ever touched it — but it must never win over
+ * a value the user holds, or the setting is unlocked in name only.
+ *
+ * The rule used to be "unlocked wins unless the user diverged from the app
+ * default", which could not work: `updateSettings` backfills every default into
+ * storage on the first write, so it could not tell "the user chose this" from
+ * "never touched". Any setting whose plugin value differed from the app default
+ * became permanently unchangeable — the displayed value came from the plugin,
+ * so pressing a toggle wrote the value already in storage and the write was
+ * discarded as a no-op.
+ *
+ * Briefly it was "unlocked never applies at read time", which broke the other
+ * way: a plugin-supplied value was invisible until a plugin refresh seeded it,
+ * so the Streamystats watchlists tab disappeared after a reload.
+ */
+export const resolveEffectiveSettings = (
+  raw: Partial<Settings> | null,
+  plugin: PluginLockableSettings | undefined,
+  defaults: Settings,
+  normalize: NormalizePluginValue,
+): Settings => {
+  const merged = { ...defaults, ...raw } as Record<string, unknown>;
+  const unlockedFallbacks: Record<string, unknown> = {};
+  const lockedOverrides: Record<string, unknown> = {};
+
+  for (const [key, setting] of Object.entries(plugin ?? {})) {
+    if (!setting) continue;
+    const settingsKey = key as keyof Settings;
+    const value = normalize(settingsKey, setting.value);
+
+    if (setting.locked) {
+      lockedOverrides[key] = value;
+    } else if (
+      !hasMeaningfulSettingValue(merged[key]) &&
+      hasMeaningfulSettingValue(value)
+    ) {
+      unlockedFallbacks[key] = value;
+    }
+  }
+
+  return { ...merged, ...unlockedFallbacks, ...lockedOverrides } as Settings;
+};
+
+/**
+ * Unlocked plugin values that still need seeding into user storage.
+ *
+ * Seeded once per distinct admin default: `applied` records what was last
+ * written, so re-running this is a no-op and a user's later change is never
+ * reverted — while an admin *changing* the default does propagate.
+ */
+export const pendingPluginDefaults = (
+  plugin: PluginLockableSettings | undefined,
+  applied: AppliedPluginDefaults,
+  normalize: NormalizePluginValue,
+): Partial<Settings> => {
+  const pending: Record<string, unknown> = {};
+  for (const [key, setting] of Object.entries(plugin ?? {})) {
+    if (!setting || setting.locked) continue;
+    const settingsKey = key as keyof Settings;
+    if (NEVER_SEED_KEYS.has(settingsKey)) continue;
+    const value = normalize(settingsKey, setting.value);
+    if (!hasMeaningfulSettingValue(value)) continue;
+    // Structural compare: object-typed settings ({ key, value }) are rebuilt by
+    // normalize on every call, so reference equality would re-seed forever.
+    if (JSON.stringify(applied[settingsKey]) === JSON.stringify(value)) {
+      continue;
+    }
+    pending[key] = value;
+  }
+  return pending as Partial<Settings>;
+};
+
+/**
+ * The overlay a plugin refresh should write, and the applied-defaults record
+ * to persist with it, or null when there is nothing to seed.
+ *
+ * The refresh runs while the user can be changing settings (the intro sheet
+ * is up during first-run login), so the caller merges this into the settings
+ * inside the settings write rather than into a render-time snapshot. Building
+ * the merge from the snapshot instead resurrected whatever the user had just
+ * overwritten when the refresh's fetch resolved after their toggle.
+ */
+export const pluginRefreshOverlay = (
+  plugin: PluginLockableSettings | undefined,
+  recorded: AppliedPluginDefaults,
+  normalize: NormalizePluginValue,
+): {
+  overlay: Partial<Settings>;
+  applied: AppliedPluginDefaults;
+} | null => {
+  // Only what the admin declared is applied. An admin who wants to impose a
+  // search engine declares searchEngine, locked to impose it or unlocked to
+  // propose it, like any other setting: inferring it from a Streamystats
+  // address took the choice away without saying so.
+  //
+  // A record an earlier build wrote names Seerr's settings as Jellyseerr's:
+  // read under the old names, a default applied then would be applied again.
+  const applied = { ...recorded } as Record<string, unknown>;
+  renameLegacySeerrSettings(applied);
+
+  const pending = pendingPluginDefaults(plugin, applied, normalize);
+  if (Object.keys(pending).length === 0) {
+    return null;
+  }
+  return {
+    overlay: pending,
+    applied: { ...applied, ...pending },
+  };
+};
+
+/**
+ * The three Seerr settings under the names they had when Seerr was called
+ * Jellyseerr, and their names now. Earlier builds stored them under the old
+ * names, and the plugin still sends them so for the apps already in the field.
+ */
+export const LEGACY_SEERR_SETTINGS = [
+  ["jellyseerrServerUrl", "seerrServerUrl"],
+  ["jellyseerrApiKey", "seerrApiKey"],
+  ["autoLoginJellyseerr", "autoLoginSeerr"],
+] as const;
+
+/** Moves the user's Seerr settings to their new names. True if it moved one. */
+export const renameLegacySeerrSettings = (
+  stored: Record<string, unknown>,
+): boolean => {
+  let changed = false;
+  for (const [legacy, current] of LEGACY_SEERR_SETTINGS) {
+    if (!(legacy in stored)) continue;
+    if (stored[current] === undefined) stored[current] = stored[legacy];
+    delete stored[legacy];
+    changed = true;
+  }
+  return changed;
+};
+
+/**
+ * Seerr as the plugin serves it, under the app's own names.
+ *
+ * The plugin serves the same three settings twice while its wire moves: as a
+ * `seerr` block, the shape it is moving to, and as flat keys still spelt
+ * jellyseerr, which every earlier app reads by name and every plugin from
+ * before the block sends alone. The block is read first and the flat keys fill
+ * what it leaves out; where the plugin sends both it keeps them in step.
+ * Neither old shape is handed on. The flat keys leave the plugin in its
+ * breaking release, once the apps in the field read the block, and this
+ * fallback goes with them.
+ */
+export const readIntegrationBlocks = (
+  plugin: PluginLockableSettings | undefined,
+): PluginLockableSettings | undefined => {
+  // Typed, not checked: whatever a server sends under `settings` gets here.
+  if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) {
+    return undefined;
+  }
+
+  const sent = plugin as Record<string, unknown>;
+  if (
+    !("seerr" in sent) &&
+    !LEGACY_SEERR_SETTINGS.some(([legacy]) => legacy in sent)
+  ) {
+    return plugin;
+  }
+
+  // Bare, not wrapped like a setting: the block has no lock of its own, each
+  // of its entries carries one (SeerrSettings in the plugin).
+  const { seerr: block, ...read } = sent;
+  const inBlock =
+    block && typeof block === "object"
+      ? (block as Record<string, unknown>)
+      : {};
+
+  for (const [from, to] of [
+    ["serverUrl", "seerrServerUrl"],
+    ["apiKey", "seerrApiKey"],
+    ["autoLogin", "autoLoginSeerr"],
+  ] as const) {
+    if (inBlock[from] !== undefined) read[to] = inBlock[from];
+  }
+  for (const [legacy, current] of LEGACY_SEERR_SETTINGS) {
+    if (read[current] === undefined && read[legacy] !== undefined) {
+      read[current] = read[legacy];
+    }
+    delete read[legacy];
+  }
+
+  return read as PluginLockableSettings;
+};
+
+/**
+ * Drops the secrets an earlier build seeded into the user's settings, and
+ * their entries in the record of what was seeded, since none is seeded now.
+ *
+ * A copy that still matches the record came from the plugin and was never
+ * changed; one that differs is the user's own and stays. True if it changed
+ * either.
+ */
+export const dropSeededSecrets = (
+  stored: Record<string, unknown>,
+  applied: Record<string, unknown>,
+): boolean => {
+  let changed = false;
+  for (const key of SENSITIVE_SETTING_KEYS) {
+    if (!(key in applied)) continue;
+    if (
+      key in stored &&
+      JSON.stringify(stored[key]) === JSON.stringify(applied[key])
+    ) {
+      delete stored[key];
+    }
+    delete applied[key];
+    changed = true;
+  }
+  return changed;
+};

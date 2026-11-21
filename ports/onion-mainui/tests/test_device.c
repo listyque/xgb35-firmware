@@ -1,0 +1,525 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+#include "app/device_job.h"
+#include "app/settings_page.h"
+#include "platform/audio.h"
+#include "platform/device_adapter.h"
+#include "platform/device_info.h"
+#include "platform/files.h"
+#undef NDEBUG
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#undef main
+
+typedef struct {
+    int calls, fail_at;
+    bool block, block_scan;
+    int ignore_cancel_ms; /* non-cooperating backend: finish late regardless */
+    const char *list;     /* LIST_NETWORKS reply, else none saved */
+    char commands[32][256];
+} Fake;
+
+static int finish_power_transition(void *context)
+{
+    MainUIDeviceJob *job = context;
+    for (int i = 0; i < 30; ++i) {
+        assert(!atomic_load(&job->cancel));
+        SDL_Delay(1);
+    }
+    return 0;
+}
+
+/* A slow enable: runs until cancelled, at most 3 s. */
+static int slow_enable(void *context)
+{
+    MainUIDeviceJob *job = context;
+    for (int i = 0; i < 3000 && !atomic_load(&job->cancel); ++i) {
+        SDL_Delay(1);
+    }
+    job->success = !atomic_load(&job->cancel);
+    atomic_store_explicit(&job->done, true, memory_order_release);
+    return 0;
+}
+
+static bool transport(void *context, const char *command, char *reply, size_t size,
+                      MainUICancel cancel)
+{
+    Fake *fake = context;
+    assert(fake->calls < 32);
+    snprintf(fake->commands[fake->calls++], 256, "%s", command);
+    if (fake->ignore_cancel_ms) {
+        SDL_Delay((Uint32)fake->ignore_cancel_ms);
+        return false;
+    }
+    if (fake->block || (fake->block_scan && !strcmp(command, "SCAN"))) {
+        for (int i = 0; i < 1000 && !mainui_cancelled(cancel); ++i) {
+            SDL_Delay(1);
+        }
+        return false;
+    }
+    if (mainui_cancelled(cancel)) {
+        return false;
+    }
+    const char *text =
+        fake->calls == fake->fail_at      ? "FAIL\n"
+        : !strcmp(command, "ADD_NETWORK") ? "7\n"
+        : !strcmp(command, "LIST_NETWORKS")
+            ? (fake->list ? fake->list : "network id / ssid / bssid / flags\n")
+        : !strcmp(command, "SCAN_RESULTS")
+            ? "bssid / frequency / signal level / flags / ssid\naa\t2412\t-50\t[WPA2]\tHost Wi-Fi\n"
+        : !strcmp(command, "SIGNAL_POLL") ? "RSSI=-81\nLINKSPEED=54\n"
+        : !strcmp(command, "STATUS")
+            ? "wpa_state=COMPLETED\nssid=Host Wi-Fi\nip_address=192.0.2.1\n"
+            : "OK\n";
+    snprintf(reply, size, "%s", text);
+    return true;
+}
+
+static void put(const char *root, const char *name, const char *text)
+{
+    char file[4096];
+    snprintf(file, sizeof file, "%s/%s", root, name);
+    assert(mainui_write_text_atomic(file, text));
+}
+
+static bool always_cancel(void *context)
+{
+    (void)context;
+    return true;
+}
+
+typedef struct {
+    const char *serial, *model, *maximum, *current, *memory;
+    uint64_t used, total, pll;
+    int pll_calls;
+} InfoFixture;
+
+static bool info_text(void *context, const char *path, char *out, size_t size)
+{
+    InfoFixture *fixture = context;
+    const char *text = NULL;
+    if (!strcmp(path, "/runtime/deviceSN")) {
+        text = fixture->serial;
+    }
+    else if (!strcmp(path, "/runtime/deviceModel")) {
+        text = fixture->model;
+    }
+    else if (!strcmp(path, "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")) {
+        text = fixture->maximum;
+    }
+    else if (!strcmp(path, "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq")) {
+        text = fixture->current;
+    }
+    else if (!strcmp(path, "/proc/meminfo")) {
+        text = fixture->memory;
+    }
+    if (!text || strlen(text) >= size) {
+        return false;
+    }
+    strcpy(out, text);
+    return true;
+}
+
+static bool info_storage(void *context, const char *sd, uint64_t *used, uint64_t *total)
+{
+    InfoFixture *fixture = context;
+    assert(!strcmp(sd, "/test-sd"));
+    *used = fixture->used;
+    *total = fixture->total;
+    return true;
+}
+
+static bool info_cpu(void *context, uint64_t *mhz)
+{
+    InfoFixture *fixture = context;
+    fixture->pll_calls++;
+    *mhz = fixture->pll;
+    return true;
+}
+
+static void about_readings(void)
+{
+    MainUIDeviceAdapter adapter = {.backend = DEVICE_ONION, .runtime = "/runtime"};
+    InfoFixture fixture = {.serial = "012345aBcDeF\n",
+                           .model = "354\n",
+                           .maximum = "1200000\n",
+                           .current = "800000\n",
+                           .memory = "MemTotal:  112640 kB\nMemFree:  2048 kB\n",
+                           .used = 3ull * 1073741824 + 700,
+                           .total = 32ull * 1073741824,
+                           .pll = 1600};
+    MainUIDeviceInfoSource source = {&fixture, info_text, info_storage, info_cpu};
+    MainUIDeviceInfo info;
+    mainui_device_info(&adapter, "/test-sd", &source, &info);
+    assert(!strcmp(info.serial, "012345aBcDeF"));
+    assert(!strcmp(info.cpu, "1200MHz") && fixture.pll_calls == 0);
+    assert(!strcmp(info.memory, "128M"));
+    assert(!strcmp(info.storage, "3G/32G"));
+    fixture.maximum = NULL;
+    mainui_device_info(&adapter, "/test-sd", &source, &info);
+    assert(!strcmp(info.cpu, "800MHz"));
+    fixture.current = NULL;
+    mainui_device_info(&adapter, "/test-sd", &source, &info);
+    assert(!strcmp(info.cpu, "1600MHz") && fixture.pll_calls == 1);
+    fixture.model = "285";
+    fixture.serial = "bad serial";
+    fixture.memory = "MemTotal: 18446744073709551616 kB";
+    fixture.used = fixture.total + 1;
+    mainui_device_info(&adapter, "/test-sd", &source, &info);
+    assert(!strcmp(info.serial, "Unknown") && !strcmp(info.cpu, "Unknown"));
+    assert(!strcmp(info.memory, "Unknown") && !strcmp(info.storage, "Unknown"));
+    assert(fixture.pll_calls == 1); /* Never map the Mini PLL on another model. */
+    fixture.maximum = "1200000 trailing";
+    fixture.current = "-800000";
+    fixture.memory = "MemTotal: 112640 MB";
+    fixture.total = fixture.used = 0;
+    mainui_device_info(&adapter, "/test-sd", &source, &info);
+    assert(!strcmp(info.cpu, "Unknown") && !strcmp(info.memory, "Unknown"));
+    assert(!strcmp(info.storage, "Unknown"));
+    assert(mainui_device_pll_mhz(3019898 & 65535, 3019898 >> 16, 1, 0) == 1200);
+    assert(mainui_device_pll_mhz(0, 0, 1, 3019898) == 1200);
+    assert(mainui_device_pll_mhz(0, 0, 1, 0) == 0);
+    assert(mainui_device_pll_mhz(1, 0, 0, 0) == 0);
+}
+
+int main(int argc, char **argv)
+{
+    assert(argc == 2);
+    about_readings();
+    /* axp_test's line, as stock MainUI reads it: 2 and 3 are charging. */
+    assert(mainui_axp_charging("{\"battery\":87, \"voltage\":4100, \"charging\":3}"));
+    assert(mainui_axp_charging("{\"battery\":99, \"voltage\":4180, \"charging\":2}"));
+    assert(!mainui_axp_charging("{\"battery\":87, \"voltage\":4100, \"charging\":0}"));
+    assert(!mainui_axp_charging("{\"battery\":100, \"voltage\":4200, \"charging\":1}"));
+    assert(!mainui_axp_charging("") && !mainui_axp_charging("axp_test: error") &&
+           !mainui_axp_charging(NULL));
+    const char *root = argv[1];
+    MainUIDeviceAdapter adapter;
+    assert(mainui_device_adapter_open(&adapter, DEVICE_SIMULATED, root));
+    assert(mainui_device_brightness(&adapter, 0));
+    assert(mainui_device_brightness(&adapter, 10));
+    assert(!mainui_device_brightness(&adapter, -1));
+    assert(!mainui_device_brightness(&adapter, 11));
+    char duty_path[4096];
+    snprintf(duty_path, sizeof duty_path, "%s/duty_cycle", root);
+    char *duty = mainui_read_text(duty_path, 32);
+    assert(duty && !strcmp(duty, "100"));
+    free(duty);
+    MainUIDeviceStatus state = mainui_device_status(&adapter);
+    assert(!state.model.id && state.battery == -1 && state.wifi == -1);
+    assert(!mainui_device_power_off(&adapter));
+    put(root, "deviceModel", "285\n");
+    put(root, "percBat", "63\n");
+    put(root, "lid", "0\n");
+    put(root, "sleeping", "1\n");
+    state = mainui_device_status(&adapter);
+    assert(state.model.lid && state.battery == 63 && state.lid == 0 && state.sleeping == 1);
+    put(root, "charging", "1");
+    state = mainui_device_status(&adapter);
+    assert(state.charging && state.battery == 63);
+    put(root, "charging", "0");
+    put(root, "percBat", "101");
+    assert(mainui_device_status(&adapter).battery == -1);
+    put(root, "percBat", "500");
+    state = mainui_device_status(&adapter);
+    assert(state.charging && state.battery == 500);
+    put(root, "percBat", "12junk");
+    put(root, "lid", "2");
+    put(root, "sleeping", "0");
+    state = mainui_device_status(&adapter);
+    assert(state.battery == -1 && state.lid == -1 && state.sleeping == 0);
+    put(root, "deviceModel", "283");
+    assert(!mainui_device_connect(&adapter, "Host", "password", (MainUICancel){0}));
+    put(root, "deviceModel", "354");
+    Fake fake = {0};
+    adapter.transport = transport;
+    adapter.transport_context = &fake;
+    assert(mainui_device_connect(&adapter, "Bob's $Wi-Fi", "pass'word", (MainUICancel){0}));
+    assert(fake.calls == 7);
+    assert(!strcmp(fake.commands[1], "SET_NETWORK 7 ssid \"Bob's $Wi-Fi\""));
+    assert(!strcmp(fake.commands[2], "SET_NETWORK 7 psk \"pass'word\""));
+    assert(!strcmp(fake.commands[4], "SELECT_NETWORK 7"));
+    assert(!strcmp(fake.commands[5], "LIST_NETWORKS"));
+    assert(!strcmp(fake.commands[6], "SAVE_CONFIG"));
+    /* SELECT_NETWORK disabled the other saved networks: they are enabled
+     * again, without connecting, before the configuration is saved. */
+    fake = (Fake){.list = "network id / ssid / bssid / flags\n"
+                          "0\tHome\tany\t[DISABLED]\n1\tWork\tany\t[TEMP-DISABLED]\n"
+                          "2\tCafe\tany\t[DISABLED]\n7\tNew\tany\t[CURRENT]\n"};
+    assert(mainui_device_connect(&adapter, "New", "password", (MainUICancel){0}));
+    assert(fake.calls == 9 && !strcmp(fake.commands[6], "ENABLE_NETWORK 0 no-connect") &&
+           !strcmp(fake.commands[7], "ENABLE_NETWORK 2 no-connect") &&
+           !strcmp(fake.commands[8], "SAVE_CONFIG"));
+    fake = (Fake){0};
+    assert(mainui_device_connect(&adapter, "Open", "", (MainUICancel){0}));
+    assert(!strcmp(fake.commands[2], "SET_NETWORK 7 key_mgmt NONE"));
+    for (int failure = 1; failure <= 7; ++failure) {
+        fake = (Fake){.fail_at = failure};
+        /* Enabling the other networks again is best effort. */
+        assert(mainui_device_connect(&adapter, "Host", "password", (MainUICancel){0}) ==
+               (failure == 6));
+        if (failure > 1 && failure != 6) {
+            assert(!strcmp(fake.commands[fake.calls - 1], "REMOVE_NETWORK 7"));
+        }
+    }
+    /* A saved network connects with its saved entry: nothing is added or
+     * saved. Of duplicates, the newest (a password entered again) is used. */
+    const char *saved = "network id / ssid / bssid / flags\n"
+                        "3\tHome\tany\t[DISABLED]\n4\tWork\tany\t[DISABLED]\n"
+                        "5\tWork\tany\t[DISABLED]\n6\tWork 2\tany\t\n";
+    fake = (Fake){.list = saved};
+    assert(mainui_device_connect_saved(&adapter, "Work", (MainUICancel){0}));
+    assert(fake.calls == 5 && !strcmp(fake.commands[0], "LIST_NETWORKS") &&
+           !strcmp(fake.commands[1], "SELECT_NETWORK 5") &&
+           !strcmp(fake.commands[3], "ENABLE_NETWORK 3 no-connect") &&
+           !strcmp(fake.commands[4], "ENABLE_NETWORK 4 no-connect"));
+    for (int i = 0; i < fake.calls; ++i) {
+        assert(strncmp(fake.commands[i], "ADD_NETWORK", 11) &&
+               strncmp(fake.commands[i], "SET_NETWORK", 11) &&
+               strcmp(fake.commands[i], "SAVE_CONFIG") &&
+               strncmp(fake.commands[i], "REMOVE_NETWORK", 14));
+    }
+    /* The one in use wins over a newer one. */
+    fake = (Fake){.list = "network id / ssid / bssid / flags\n"
+                          "3\tWork\tany\t[CURRENT]\n4\tWork\tany\t[DISABLED]\n"};
+    assert(mainui_device_connect_saved(&adapter, "Work", (MainUICancel){0}));
+    assert(!strcmp(fake.commands[1], "SELECT_NETWORK 3"));
+    fake = (Fake){.list = saved};
+    assert(!mainui_device_connect_saved(&adapter, "Wor", (MainUICancel){0}));
+    assert(fake.calls == 1 && *adapter.error);
+    fake = (Fake){.list = saved, .fail_at = 2};
+    assert(!mainui_device_connect_saved(&adapter, "Home", (MainUICancel){0}));
+    assert(fake.calls == 2);
+    fake = (Fake){.list = saved};
+    assert(!mainui_device_connect_saved(&adapter, "bad\"SSID", (MainUICancel){0}));
+    assert(!fake.calls);
+    fake = (Fake){0};
+    assert(!mainui_device_connect(&adapter, "bad\"SSID", "password", (MainUICancel){0}));
+    assert(
+        !mainui_device_connect(&adapter, "Host", "password", (MainUICancel){always_cancel, NULL}));
+    assert(!fake.calls);
+    /* A scan keeps the saved list for the Wi-Fi page. The first status
+     * refresh after Wi-Fi starts enables saved networks an earlier
+     * SELECT_NETWORK left disabled, without connecting; later ones do not. */
+    assert(mainui_device_wifi_enable(&adapter, false, (MainUICancel){0}));
+    fake = (Fake){.list = saved};
+    assert(mainui_device_scan(&adapter, (MainUICancel){0}));
+    assert(fake.calls == 9 && !strcmp(fake.commands[2], "LIST_NETWORKS") &&
+           !strcmp(fake.commands[5], "LIST_NETWORKS") &&
+           !strcmp(fake.commands[6], "ENABLE_NETWORK 3 no-connect") &&
+           !strcmp(fake.commands[8], "ENABLE_NETWORK 5 no-connect"));
+    char saved_file[4096];
+    snprintf(saved_file, sizeof saved_file, "%s/wifi-saved.txt", root);
+    char *kept = mainui_read_text(saved_file, 16384);
+    assert(kept && !strcmp(kept, saved));
+    free(kept);
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 2);
+    /* Enabling that fails (no list, or a refused network) is tried again
+     * with the next refresh, until it works. */
+    assert(mainui_device_wifi_enable(&adapter, false, (MainUICancel){0}));
+    fake = (Fake){.list = saved, .fail_at = 3};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 3);
+    fake = (Fake){.list = saved, .fail_at = 5};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 6);
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 6);
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 2);
+    /* So is enabling that fails after a later SELECT_NETWORK, whether a
+     * network was chosen with a password or as a saved one, and when the
+     * selection's answer is lost. */
+    fake = (Fake){.list = saved, .fail_at = 6};
+    assert(mainui_device_connect(&adapter, "Host", "password", (MainUICancel){0}));
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 6);
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 2);
+    fake = (Fake){.list = saved, .fail_at = 4};
+    assert(mainui_device_connect_saved(&adapter, "Work", (MainUICancel){0}));
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 6);
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 2);
+    fake = (Fake){.list = saved, .fail_at = 2};
+    assert(!mainui_device_connect_saved(&adapter, "Work", (MainUICancel){0}));
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 6);
+    fake = (Fake){.list = saved};
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}) && fake.calls == 2);
+    /* No saved list: the file goes, so no network is taken for saved. */
+    fake = (Fake){.fail_at = 3};
+    assert(mainui_device_scan(&adapter, (MainUICancel){0}));
+    assert(!mainui_file_stamp(saved_file).exists);
+    fake = (Fake){0};
+    assert(mainui_device_scan(&adapter, (MainUICancel){0}));
+    state = mainui_device_status(&adapter);
+    assert(state.wifi == 1 && !strcmp(state.ssid, "Host Wi-Fi") &&
+           !strcmp(state.address, "192.0.2.1"));
+    assert(state.wifi_signal == 1);
+    fake = (Fake){.fail_at = 2}; /* SIGNAL_POLL failure must retain connection state. */
+    assert(mainui_device_refresh(&adapter, (MainUICancel){0}));
+    state = mainui_device_status(&adapter);
+    assert(state.wifi == 1 && state.wifi_signal == 0);
+    const int dbm[] = {-127, -126, -81, -80, -71, -70, 127, 128};
+    const int levels[] = {0, 1, 1, 2, 2, 3, 3, 0};
+    for (size_t i = 0; i < sizeof dbm / sizeof *dbm; ++i) {
+        char status_text[128];
+        snprintf(status_text, sizeof status_text, "wpa_state=COMPLETED\nRSSI=%d\n", dbm[i]);
+        put(root, "wifi-status.txt", status_text);
+        assert(mainui_device_status(&adapter).wifi_signal == levels[i]);
+    }
+    put(root, "wifi-status.txt", "wpa_state=COMPLETED\nRSSI=bad\n");
+    assert(mainui_device_status(&adapter).wifi_signal == 0);
+    MainUISettingsPage page = {0};
+    /* A saved secure network connects without a password (7); one whose
+     * saved attempt failed, or one not saved, asks for it (2). */
+    put(root, "wifi-scan.txt",
+        "bssid / frequency / signal level / flags / ssid\n"
+        "aa\t2412\t-50\t[WPA2]\tWork\n"
+        "bb\t2412\t-50\t[WPA2]\tWork 2 x\n"
+        "cc\t2412\t-50\t[ESS]\tOpen\n");
+    put(root, "wifi-saved.txt", saved);
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.network_count == 3 && page.network_saved[0] && !page.network_saved[1] &&
+           !page.network_saved[2]);
+    page.kind = SET_WIFI;
+    page.open = page.managed_device = true;
+    page.wifi = 1;
+    page.selected = 1;
+    assert(mainui_settings_page_key(&page, SDLK_RETURN, NULL, NULL) == 7 &&
+           !strcmp(page.ssid, "Work"));
+    snprintf(page.retry_ssid, sizeof page.retry_ssid, "Work");
+    assert(mainui_settings_page_key(&page, SDLK_RETURN, NULL, NULL) == 2);
+    page.selected = 2;
+    assert(mainui_settings_page_key(&page, SDLK_RETURN, NULL, NULL) == 2);
+    page.selected = 3;
+    assert(mainui_settings_page_key(&page, SDLK_RETURN, NULL, NULL) == 3);
+    mainui_remove_file(saved_file);
+    page = (MainUISettingsPage){0};
+    put(root, "wifi-scan.txt",
+        "bssid / frequency / signal level / flags / ssid\n"
+        "aa\t2412\t-81\t[WPA2]\tWeak\n"
+        "bb\t2412\t-80\t[WPA2]\tMedium\n"
+        "cc\t2412\t-70\t[WPA2]\tStrong\n");
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.network_count == 3 && page.network_signal[0] == 1 && page.network_signal[1] == 2 &&
+           page.network_signal[2] == 3);
+    page.selected = 2;
+    put(root, "wifi-scan.txt",
+        "bssid / frequency / signal level / flags / ssid\n"
+        "bb\t2412\t-71\t[WPA2]\tMedium\n"
+        "aa\t2412\t-90\t[WPA2]\tWeak\n");
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.selected == 1 && !strcmp(page.networks[0], "Medium"));
+    put(root, "wifi-scan.txt",
+        "bssid / frequency / signal level / flags / ssid\n"
+        "aa\t2412\t-90\t[WPA2]\tWeak\n");
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.selected == 1 && !strcmp(page.networks[0], "Weak"));
+    /* A vanished last row clamps to the last remaining network. */
+    put(root, "wifi-scan.txt",
+        "bssid / frequency / signal level / flags / ssid\n"
+        "aa\t2412\t-90\t[WPA2]\tWeak\n"
+        "bb\t2412\t-70\t[WPA2]\tStrong\n");
+    mainui_settings_page_scan_results(&page, root);
+    page.selected = 2;
+    put(root, "wifi-scan.txt",
+        "bssid / frequency / signal level / flags / ssid\n"
+        "aa\t2412\t-90\t[WPA2]\tWeak\n");
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.selected == 1);
+    page.selected = 0;
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.selected == 0); /* Preserve an intentionally selected toggle. */
+    page.selected = 1;
+    put(root, "wifi-scan.txt", "bssid / frequency / signal level / flags / ssid\n");
+    mainui_settings_page_scan_results(&page, root);
+    assert(page.network_count == 0 && page.selected == 0);
+    const char *bad_signals[] = {"999999999999999999999999",
+                                 "-999999999999999999999999",
+                                 "128",
+                                 "-127",
+                                 "-70junk",
+                                 "",
+                                 "bad"};
+    for (size_t i = 0; i < sizeof bad_signals / sizeof *bad_signals; ++i) {
+        char scan_text[256];
+        snprintf(scan_text, sizeof scan_text,
+                 "bssid / frequency / signal level / flags / ssid\n"
+                 "aa\t2412\t%s\t[WPA2]\tMalformed signal\n",
+                 bad_signals[i]);
+        put(root, "wifi-scan.txt", scan_text);
+        mainui_settings_page_scan_results(&page, root);
+        assert(page.network_count == 1 && page.network_signal[0] == 1);
+    }
+    fake = (Fake){.fail_at = 1};
+    assert(!mainui_device_refresh(&adapter, (MainUICancel){0}));
+    assert(mainui_device_status(&adapter).wifi == -1);
+    put(root, "wifi-status.txt", "wpa_state=not-a-real-state\n");
+    assert(mainui_device_status(&adapter).wifi == -1);
+    assert(mainui_device_power_off(&adapter));
+    assert(!mainui_device_power_off(&adapter)); /* no duplicate/overwrite */
+    assert(mainui_device_settings_changed(&adapter));
+    assert(!mainui_audio_available());
+    mainui_audio_pause(true);
+    mainui_audio_pause(false);
+    mainui_audio_close();
+    assert(SDL_Init(SDL_INIT_TIMER) == 0);
+    fake = (Fake){.block = true};
+    MainUIDeviceJob job = {0};
+    assert(mainui_device_job_start(&job, &adapter, 3, "Host", "password"));
+    SDL_Delay(10);
+    Uint32 started = SDL_GetTicks();
+    mainui_device_job_close(&job);
+    assert(SDL_GetTicks() - started < 500 && !job.thread && !*job.password);
+    /* A backend that ignores cancellation delays close by its own duration
+     * only; close then still joins and clears the job. */
+    fake = (Fake){.ignore_cancel_ms = 400};
+    assert(mainui_device_job_start(&job, &adapter, 4, NULL, NULL));
+    SDL_Delay(10);
+    started = SDL_GetTicks();
+    mainui_device_job_close(&job);
+    Uint32 waited = SDL_GetTicks() - started;
+    assert(waited >= 300 && waited < 1500 && !job.thread && !job.operation);
+    assert(fake.calls == 1);
+    fake = (Fake){.block_scan = true};
+    assert(mainui_device_job_start(&job, &adapter, 4, NULL, NULL));
+    SDL_Delay(10);
+    assert(mainui_device_job_start(&job, &adapter, 3, "Host", "password"));
+    assert(job.queued_operation == 3);
+    int completed = -1;
+    started = SDL_GetTicks();
+    while (completed < 0 && SDL_GetTicks() - started < 2000) {
+        completed = mainui_device_job_take(&job);
+        SDL_Delay(1);
+    }
+    assert(completed == 1 && job.operation == 3);
+    assert(!strcmp(fake.commands[fake.calls - 1], "SAVE_CONFIG"));
+    mainui_device_job_close(&job);
+    for (int operation = 5; operation <= 6; ++operation) {
+        job = (MainUIDeviceJob){.adapter = adapter, .operation = operation};
+        atomic_init(&job.cancel, false);
+        job.thread = SDL_CreateThread(finish_power_transition, &job);
+        assert(job.thread);
+        mainui_device_job_close(&job);
+        assert(!job.thread);
+    }
+    /* On, then Off, then launch: the enable is stopped at once and the Off
+     * runs, instead of waiting out the close budget and skipping the Off. */
+    job = (MainUIDeviceJob){.adapter = adapter, .operation = 5};
+    atomic_init(&job.cancel, false);
+    atomic_init(&job.done, false);
+    job.thread = SDL_CreateThread(slow_enable, &job);
+    assert(job.thread);
+    SDL_Delay(10);
+    assert(mainui_device_job_start(&job, &adapter, 6, NULL, NULL));
+    assert(job.queued_operation == 6 && !atomic_load(&job.cancel));
+    started = SDL_GetTicks();
+    mainui_device_job_close(&job);
+    assert(SDL_GetTicks() - started < 500 && !job.thread && !job.queued_operation);
+    SDL_Quit();
+    puts("Device status, Wi-Fi failure, cancellation and power contracts passed");
+    return 0;
+}

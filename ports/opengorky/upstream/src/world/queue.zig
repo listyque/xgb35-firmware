@@ -1,0 +1,226 @@
+//! Actor command queue (animation, delay, call, path, turn) and animation frame sounds
+//! (0x44fb74…0x44fbe8).
+
+const std = @import("std");
+const world = @import("../state.zig").world;
+const World = world.World;
+const Object = @import("../script.zig").object.Object;
+const actor_mod = @import("../actor.zig");
+const fields = @import("../fields.zig");
+const model_cache = @import("../actor.zig").model_cache;
+const Model = model_cache.Model;
+const route = @import("route.zig");
+const areas = @import("areas.zig");
+const floor_mod = @import("floor.zig");
+
+/// Animation frame sounds (0x44fb74…0x44fbe8): reaching a marked frame plays the sound at
+/// the actor; several marks on one frame pick one at random.
+pub fn animCues(self: *World, o: *Object, a: *actor_mod.Actor, m: *const Model) !void {
+    const an = m.anims.find(a.anim) orelse {
+        a.cue_anim = "";
+        return;
+    };
+    if (an.sounds.len == 0) {
+        a.cue_anim = a.anim;
+        return;
+    }
+    // A stopped animation (freeze, anim flag +0x34) neither steps nor sounds: 0x44faf1 exits
+    // before frame sounds. A transition to a new animation (+0x19 = 2, our anim_hold) is
+    // silent too; first-frame sounds play once it ends (0x44fb28 → 0x44fb74).
+    if (a.anim_paused or a.anim_hold > 0) return;
+    const f = m.frameOf(a.anim, a.anim_ticks, a.loop);
+    if (a.mute_cues) {
+        a.cue_anim = a.anim;
+        a.cue_frame = f;
+        a.cue_fresh = false;
+        return;
+    }
+    const fresh = !std.mem.eql(u8, a.cue_anim, a.anim) or a.cue_fresh;
+    a.cue_fresh = false;
+    const from: u32 = if (fresh) an.first else a.cue_frame + 1;
+    defer {
+        a.cue_anim = a.anim;
+        a.cue_frame = f;
+    }
+    if (!fresh and f == a.cue_frame) return;
+    // Frames (from..f], wrapping for looping animations.
+    var ranges: [2][2]u32 = undefined;
+    var nr: usize = 0;
+    if (f >= from) {
+        ranges[0] = .{ from, f };
+        nr = 1;
+    } else {
+        ranges[0] = .{ from, an.last };
+        ranges[1] = .{ an.first, f };
+        nr = 2;
+    }
+    const rand = self.crt();
+    for (ranges[0..nr]) |rg| {
+        var fr = rg[0];
+        while (fr <= rg[1]) : (fr += 1) {
+            const at = an.shown(fr, a.reverse);
+            var n: u32 = 0;
+            for (an.sounds) |cue| if (cue.frame == at) {
+                n += 1;
+            };
+            if (n == 0) continue;
+            var pick = rand.below(n);
+            for (an.sounds) |cue| if (cue.frame == at) {
+                if (pick == 0) {
+                    const name = std.fs.path.stem(cue.name);
+                    const silence = @import("../core.zig").modules.ui().sounds.silence;
+                    if (silence.len == 0 or !std.ascii.eqlIgnoreCase(name, silence)) self.out.sound(self.gpa, name, self.screenPos(o));
+                    break;
+                }
+                pick -= 1;
+            };
+        }
+    }
+}
+
+/// Actor command queue: the next command runs once the one-shot animation, path and delay
+/// are done. Calls run back to back; animations and delays wait.
+pub fn runQueue(self: *World, o: *Object, a: *actor_mod.Actor) !void {
+    if (a.delay > 0) {
+        a.delay -= 1;
+        return;
+    }
+    // Commands behind a detached animation ran and the queue is empty: idle (0x4265f1 →
+    // 0x422f90; without commands the exe lets the animation finish).
+    var ran = false;
+    // A one-shot ended behind queued commands (`idle_due`): idle once none is current.
+    defer if (a.idle_due and !a.busy()) {
+        if (a.idle_off) a.frozen = true else a.pickIdle(self.crt());
+    };
+    defer if (ran and a.detached and a.one_shot and a.queue.items.len == 0 and a.delay == 0 and a.path_index >= a.path.items.len) a.pickIdle(self.crt());
+    while (a.queue.items.len > 0 and (!a.one_shot or a.async_anim or a.detached) and a.path_index >= a.path.items.len) {
+        const cmd = a.queue.orderedRemove(0);
+        ran = true;
+        switch (cmd) {
+            .anim => |name| return a.play(a.resolve(name), false, true),
+            .idle => {
+                a.forced_idle = null;
+                a.pickIdle(self.crt());
+            },
+            .delay => |n| {
+                a.delay = n;
+                return;
+            },
+            .call => |c| if (self.rt.findObject(c.object)) |obj| {
+                _ = try self.rt.callIfExists(obj, c.func, &.{.{ .string = o.name }});
+            },
+            .async_anim => |aa| {
+                a.play(a.resolve(aa.name), false, true);
+                a.reverse = aa.reverse;
+                a.async_anim = true;
+            },
+            .scene_anim => |sa| {
+                a.play(if (sa.logical) a.resolve(sa.name) else sa.name, false, true);
+                a.reverse = sa.reverse;
+                a.repeat_left = sa.count -| 1;
+                return;
+            },
+            // Empty name resets (scene end, 0x479075…0x47908a).
+            .idle_anim => |name| {
+                a.forced_idle = if (name.len == 0) null else a.resolve(name);
+                if (!a.one_shot) a.pickIdle(self.crt());
+            },
+            .walk_anim => |wa| a.scene_walk = if (wa.name.len == 0) null else .{ .anim = wa.name, .speed = wa.speed },
+            .walk => |bg| {
+                try route.walkTo(self, o, bg);
+                return;
+            },
+            .angle => |ang| fields.setAngle(o, ang),
+            .no_blend => a.instant = true,
+            .justify => {
+                if (self.res.models) |ms| if (ms.get(fields.meshFile(o))) |m| justifyPosition(o, a, m, self.actorScale() * m.unitScale());
+                a.instant = true;
+            },
+            // 0x422b70 drops the rest of the queue (0x427c10).
+            .place => |pl| {
+                placeAtPoint(self, o, pl.area, pl.index, 0);
+                a.instant = true;
+            },
+            .state => |st| {
+                if (st == 4) unlink(a);
+                a.setState(st, self.isCombat());
+                if (st == 4) a.pickIdle(self.crt()); // 0x42b493
+            },
+            .unlink => unlink(a),
+            .link => |l| {
+                for (a.links.items) |*e| if (std.ascii.eqlIgnoreCase(e.link, l.link)) {
+                    e.mesh = l.mesh;
+                    break;
+                } else try a.links.append(self.gpa, .{ .link = l.link, .mesh = l.mesh });
+            },
+            .wait_blend => if (a.anim_hold > 0) {
+                try a.queue.insert(self.gpa, 0, cmd);
+                return;
+            },
+            .idle_enable => |on| a.idle_off = !on,
+        }
+    }
+}
+
+/// Link count +0x30d0 = 0 (command 0x21; 0x22 with state 4): meshes off the link
+/// points, the weapon out of the hand.
+fn unlink(a: *actor_mod.Actor) void {
+    a.links.clearRetainingCapacity();
+    a.weapon_detached = true;
+}
+
+/// Actor onto area point `index` (0x422b70): queue, path and command reset first
+/// (0x427c10); no area or an index outside it leaves the actor where it is (0x422b99).
+/// The angle is the point's third coordinate; floor 1 takes the height from `.wm2` (0x422c00).
+pub fn placeAtPoint(self: *World, o: *Object, area_name: []const u8, index: i32, floor: i32) void {
+    const a = world.actorOf(o);
+    a.dropCommands(self.crt());
+    const area = areas.findArea(self, area_name) orelse return;
+    if (index < 0 or index >= area.points.len) return;
+    const p = area.points[@intCast(index)];
+    a.map = if (floor == 1) 1 else 0;
+    fields.setPos(o, floor_mod.groundOn(self, a.map, .{ p[0], p[1] }));
+    fields.setAngle(o, p[2]);
+    a.placed = true;
+}
+
+/// Actor onto battle grid tile `x`,`y` (PlaceActor's tile form, 0x48e890): tile corner at
+/// (centerX, centerY), tiles of xSize×ySize along world X and Y, floor at centerZ; facing
+/// `dir` eighths of a turn. The queue is not reset. No combat grid: nothing.
+pub fn placeOnTile(self: *World, o: *Object, x: f32, y: f32, dir: f32) void {
+    const cm = self.map.combat orelse return;
+    // Shift to the block centre by charSize (0x499ce0): 1 → 0.5, 4 → 1, 9 → 1.5.
+    const off: f32 = switch (fields.charSize(o)) {
+        1 => 0.5,
+        4 => 1.0,
+        9 => 1.5,
+        else => 0,
+    };
+    const wp = cm.toWorld(x + off, y + off);
+    fields.setPos(o, .{ wp[0], wp[1], cm.center[2] });
+    // dir·π/4 (0x48e90a).
+    fields.setAngle(o, dir * std.math.pi / 4.0);
+    world.actorOf(o).placed = true;
+}
+
+/// Actor_QueueJustifyPosition (command 0x24, 0x4240b7…0x42420f): the position moves by
+/// the drawn pose's root bone (+0x2458c, blended during a transition, 0x44fdc0) minus the
+/// current animation's last frame, in model axes (angle + AdjustAngle +0x3200, scale).
+/// The exe reads that frame as matrix [last] without × bones (0x4240e0): kept.
+pub fn justifyPosition(o: *Object, a: *const actor_mod.Actor, m: *const Model, scale_px: f32) void {
+    const fr = m.frames;
+    if (fr.bones == 0 or fr.frames == 0) return;
+    const an = m.anims.find(a.anim) orelse m.anims.find(a.shown.anim) orelse return;
+    const total_mats: usize = @as(usize, fr.frames) * fr.bones;
+    if (an.last >= total_mats) return;
+    const from = model_cache.unshift(fr.matrix(@min(a.blend_from, fr.frames - 1), 0).*, a.blend_shift);
+    const to = fr.matrix(@min(a.frameIn(m), fr.frames - 1), 0).*;
+    const last_m = fr.matrix(an.last / fr.bones, an.last % fr.bones).*;
+    const wt = a.blendWeight() orelse 1;
+    var d: [3]f32 = undefined;
+    for (&d, 0..) |*v, k| v.* = (from[9 + k] * (1 - wt) + to[9 + k] * wt - last_m[9 + k]) * scale_px;
+    // Mesh x/z horizontal, y height (as followParent).
+    const ang = fields.modelAngle(fields.angle(o) + a.angle_offset);
+    const p = fields.pos(o);
+    fields.setPos(o, .{ p[0] + d[0] * @cos(ang) - d[2] * @sin(ang), p[1] + d[0] * @sin(ang) + d[2] * @cos(ang), p[2] + d[1] });
+}

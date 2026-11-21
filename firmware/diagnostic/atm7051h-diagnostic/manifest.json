@@ -1,0 +1,65 @@
+{
+  "purpose": "Experimental RAM diagnostic, NOT a factory firmware or NAND image",
+  "hardware_tested": false,
+  "target_board": "LLW7051-057-MAIN-BOARD V2.0 (compatibility unverified)",
+  "source_update_sha256": "4db764e126b89fb82c607322061089d379bd2e6feb416fb1f58a8d086aae5f1e",
+  "source_version": "2.0.00.240519.1736",
+  "source_board_label": "057V1_vLCD0_V1.0",
+  "kernel": "Linux 3.10.52 #2 SMP PREEMPT Sun May 19 17:25:16 HKT 2024",
+  "busybox": "1.14.3, statically linked ARM ELF32, from source ramdisk",
+  "source_files_sha256": {
+    "uImage": "655ac99b3648ae19c515355406cc379c254e6413befc439811a00d9920f46e42",
+    "kernel.dtb": "642c4ff13655a37462f8fbab0779187b4ec6b7b6438c674fc321681c88d208c2",
+    "ramdisk.img": "2f29ba24fcba7536fc4ab04d594c88d6981feb00c88e6b510480fc5ab41d7e40"
+  },
+  "runtime_files": {
+    "uImage": {
+      "bytes": 2673536,
+      "sha256": "655ac99b3648ae19c515355406cc379c254e6413befc439811a00d9920f46e42"
+    },
+    "kernel.dtb": {
+      "bytes": 26598,
+      "sha256": "642c4ff13655a37462f8fbab0779187b4ec6b7b6438c674fc321681c88d208c2"
+    },
+    "ramdisk.img": {
+      "bytes": 1123783,
+      "sha256": "4459b9473fae43cc7147f5bf48164203a3f8af390acc9e4360ed51994efa1d7a"
+    },
+    "README.md": {
+      "bytes": 8730,
+      "sha256": "78ff9a0828df50ce6bdfa54d0efaba9330d39419a9154e07d4d22aca4fedd711"
+    }
+  },
+  "initramfs_entries": [
+    "bin",
+    "dev",
+    "proc",
+    "sys",
+    "tmp",
+    "root",
+    "mnt",
+    "etc",
+    "dev/console",
+    "dev/null",
+    "dev/tty",
+    "bin/busybox",
+    "bin/sh",
+    "init",
+    "bin/diagnose"
+  ],
+  "checks_passed": [
+    "source SHA256",
+    "uImage header/data CRC32",
+    "ARM ELF headers",
+    "CPIO contents, modes, root ownership, device nodes",
+    "gzip round trip",
+    "corrupt/truncated/unsafe input rejection"
+  ],
+  "not_tested": [
+    "hardware boot",
+    "shell execution on ARM",
+    "board DTB compatibility",
+    "vendor kernel storage probe behavior",
+    "U-Boot transfer/RAM addresses"
+  ]
+}

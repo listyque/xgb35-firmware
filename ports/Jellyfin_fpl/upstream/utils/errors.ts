@@ -1,0 +1,690 @@
+import {
+  BaseItemKind,
+  ItemSortBy,
+  SortOrder,
+} from "@jellyfin/sdk/lib/generated-client/models";
+import { type AxiosResponse, isAxiosError, isCancel } from "axios";
+import { JELLYFIN_ID_PATTERN } from "@/constants/Jellyfin";
+
+/**
+ * Marks errors that are user-facing outcomes rather than app defects — a
+ * wrong password, a denied permission — so the global React Query error
+ * reporting in app/_layout.tsx doesn't send them to Sentry. The underlying
+ * technical failure should already have been logged (writeErrorLog /
+ * logAndCaptureError) before the marked error is thrown for the UI.
+ */
+const EXPECTED_ERROR = Symbol.for("streamyfin.expectedError");
+
+export const markExpectedError = <T>(error: T): T => {
+  if (error !== null && typeof error === "object") {
+    (error as Record<symbol, unknown>)[EXPECTED_ERROR] = true;
+  }
+  return error;
+};
+
+/**
+ * Marks errors that have already been sent to Sentry (by logAndCaptureError)
+ * so the global React Query handler doesn't report them a second time when
+ * they're rethrown into a query/mutation.
+ */
+const REPORTED_ERROR = Symbol.for("streamyfin.reportedError");
+
+export const markErrorReported = <T>(error: T): T => {
+  if (error !== null && typeof error === "object") {
+    (error as Record<symbol, unknown>)[REPORTED_ERROR] = true;
+  }
+  return error;
+};
+
+export const isErrorReported = (error: unknown): boolean =>
+  error !== null &&
+  typeof error === "object" &&
+  (error as Record<symbol, unknown>)[REPORTED_ERROR] === true;
+
+// expo/fetch rejects a cancelled request with a plain Error whose message
+// carries the native exception name, not with an AbortError — without this
+// match a timeout abort or an iOS backgrounding cancel reads as a failure.
+const FETCH_CANCEL_PATTERN =
+  /FetchRequestCanceledException|fetch request has been canceled/i;
+
+/** True for cancelled/aborted requests (navigation away, new keystroke) —
+ * routine control flow that should never be reported as a failure. */
+export const isAbortLikeError = (error: unknown): boolean =>
+  isCancel(error) ||
+  (error instanceof Error &&
+    (error.name === "AbortError" ||
+      error.name === "CanceledError" ||
+      FETCH_CANCEL_PATTERN.test(error.message)));
+
+// A gateway status means the reverse proxy in front of Jellyfin answered but
+// Jellyfin itself did not (container down, restarting, upstream timeout) —
+// from the app's side that is an unreachable server, not an app bug. The 52x
+// and 530 codes are Cloudflare's own, which no origin ever sends, each one a
+// way of saying that Cloudflare could not get an answer out of the origin:
+// - 520: the origin answered with something empty or unreadable
+// - 521: the origin refused the connection (web server down)
+// - 522: the connection to the origin timed out
+// - 523: the origin is unreachable (routing, DNS)
+// - 524: the origin accepted the connection and then never answered
+// - 525: the TLS handshake between Cloudflare and the origin failed
+// - 526: the origin's certificate is not valid
+// - 530: sent with a 1xxx error page, in practice 1033, a Cloudflare Tunnel
+//   that is not running
+// Two more are a proxy turning the request away before any server saw it,
+// and none of the servers the app talks to answers with either:
+// - 421: Misdirected Request, the connection reached a proxy that does not
+//   serve this host name (an SNI and Host mismatch, a reused HTTP/2
+//   connection to the wrong virtual host)
+// - 444: nginx's own, its way of closing the connection without an answer
+//   on a host name or a client it was told not to serve; a client sees the
+//   number when whatever stands in front of that nginx relays it
+// One origin-down blip otherwise fans out into one issue per in-flight route.
+const GATEWAY_STATUSES = new Set([
+  421, 444, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530,
+]);
+
+/** Whether a status is a proxy's way of saying the server did not answer. */
+export const isGatewayStatus = (status: number): boolean =>
+  GATEWAY_STATUSES.has(status);
+
+// expo/fetch, which is the global fetch on native, rejects with its own
+// FetchError: a plain Error, named "Error" and without a code, whose message
+// is "fetch failed: " and the message of what the native request was rejected
+// with. For a request that got no answer that is:
+// - iOS: the URLSession error. It is not one of Expo's own exceptions, so it
+//   arrives wrapped: "UnexpectedException: <text> (at …/Promise.swift:56)".
+//   The text is in the user's language, the wrapper is not.
+// - Android: the IOException OkHttp gave up with, as its toString():
+//   "java.net.UnknownHostException: Unable to resolve host …", or the class
+//   name alone when the exception has no message.
+// What Expo rejects with for reasons of its own (a cancel, a redirect it was
+// told to refuse, "Unknown error") is named after its own exception on iOS
+// and carries no class name on Android, so none of it matches. Nor does a
+// status: expo/fetch resolves for every status, and a "fetch failed" that
+// names one was thrown by a caller that did get an answer.
+const FETCH_NO_RESPONSE_PATTERN =
+  /^fetch failed: (?:UnexpectedException: |(?:[a-z_][\w$]*\.)+[A-Z][\w$]*(?:Exception|Error)(?=:|$))/;
+
+// A status or a response attached to an error says the request was answered,
+// whatever the message reads like.
+const carriesHttpAnswer = (error: Error): boolean => {
+  const { status, response } = error as {
+    status?: unknown;
+    response?: unknown;
+  };
+  return typeof status === "number" || (response ?? null) !== null;
+};
+
+/**
+ * True for requests that never got a usable HTTP response — the server is
+ * unreachable (LAN-only server while roaming, DNS failure, timeout) or its
+ * proxy could not reach it. That is the user's environment, not an app bug,
+ * so it must never become a Sentry event. Covers axios errors, React Native's
+ * fetch TypeError and expo/fetch's "fetch failed".
+ */
+export const isConnectivityError = (error: unknown): boolean => {
+  if (isAxiosError(error)) {
+    return !error.response || isGatewayStatus(error.response.status);
+  }
+  if (!(error instanceof Error)) return false;
+  if (error instanceof TypeError) {
+    return /network request failed/i.test(error.message);
+  }
+  return (
+    FETCH_NO_RESPONSE_PATTERN.test(error.message) && !carriesHttpAnswer(error)
+  );
+};
+
+// How far into a body the HTML check reads: room for a byte order mark, some
+// leading whitespace and the opening tag, and no more. An error page can be
+// large and this runs for every 403.
+const HTML_SNIFF_CHARS = 256;
+
+// The start of an HTML document: "<!doctype html" or "<html", in any case,
+// after optional whitespace (which in a JS regex includes the byte order
+// mark). The lookahead keeps "<htmlfoo" out.
+const HTML_DOCUMENT_START = /^\s*<(?:!doctype\s+html|html)(?=[\s>])/i;
+
+const HTML_CONTENT_TYPE = /^text\/html\b/i;
+
+const isHtmlDocument = (body: unknown): boolean =>
+  typeof body === "string" &&
+  HTML_DOCUMENT_START.test(body.slice(0, HTML_SNIFF_CHARS));
+
+// Labelled as a page or starting as one, see isGatewayBlockError for why both.
+const isHtmlPage = (response: AxiosResponse): boolean =>
+  HTML_CONTENT_TYPE.test(String(response.headers?.["content-type"] ?? "")) ||
+  isHtmlDocument(response.data);
+
+/** A plain object, as parsed JSON gives: not an array, a class instance or null. */
+export const isPlainObject = (
+  value: unknown,
+): value is Record<string, unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  Object.getPrototypeOf(value) === Object.prototype;
+
+// The `type` of the problem document (RFC 9457) Cloudflare sends for one of
+// its 1xxx errors to a client that accepts JSON, which axios does: the page
+// of Cloudflare's documentation for that error. The whole value is matched,
+// host included, so a path that only resembles it on another host is not
+// taken for it.
+const CLOUDFLARE_ERROR_TYPE =
+  /^https:\/\/developers\.cloudflare\.com\/(?:[\w-]+\/)*cloudflare-1xxx-errors\/error-1\d{3}\/?$/;
+
+// What axios makes of that document. A body left as text is not looked into:
+// axios parses every JSON body the app asks for.
+const isCloudflareErrorDocument = (body: unknown): boolean =>
+  isPlainObject(body) &&
+  typeof body.type === "string" &&
+  CLOUDFLARE_ERROR_TYPE.test(body.type);
+
+/**
+ * True for a 403 that a gateway in front of the server sent in the server's
+ * place: a WAF rule, Cloudflare Access, a geo block. Told apart by the body,
+ * which is the gateway's HTML page; Jellyfin and Seerr refuse with JSON,
+ * plain text or nothing at all, and the app asks neither for HTML. Once such
+ * a block is up every route answers the same way, and none of it is
+ * something the app can act on.
+ *
+ * The page is recognised by its content type, or, since a gateway does not
+ * always label its page and sometimes labels it wrong, by the body starting
+ * as an HTML document. The body is only looked at here: it never goes onto
+ * an event, as an error page can name the user's server.
+ *
+ * Cloudflare sends the same refusal as JSON to a client that accepts it, and
+ * that one is recognised by the `type` it names itself with. Nothing else
+ * about a JSON 403 counts, the `Server: cloudflare` header least of all:
+ * every answer of a server behind Cloudflare carries it, the server's own
+ * refusals included.
+ *
+ * Only 403: a 404 or a 500 with an HTML body can still be the app asking for
+ * the wrong path, which is worth a report.
+ */
+export const isGatewayBlockError = (error: unknown): boolean => {
+  if (!isAxiosError(error) || error.response?.status !== 403) return false;
+  return (
+    isHtmlPage(error.response) || isCloudflareErrorDocument(error.response.data)
+  );
+};
+
+/**
+ * True for a page that a gateway answered with in the server's place, under
+ * a success status: a captive portal on the user's network, or the sign-in
+ * page of a proxy whose session ran out, the redirect to it followed before
+ * the app sees the answer. The app asks its servers for data, never for a
+ * page, and the network the user is on is nothing it can act on.
+ *
+ * axios resolves every 2xx, so such an answer is only an error where a call
+ * site finds the body is not what the route returns and throws it with the
+ * response (utils/jellyfin/queryResult.ts). Any other body is left to be
+ * reported: an empty one, or JSON of another shape, can still be the app
+ * reading the wrong thing.
+ */
+export const isGatewayPageError = (error: unknown): boolean => {
+  if (!isAxiosError(error) || !error.response) return false;
+  const { status } = error.response;
+  return status >= 200 && status < 300 && isHtmlPage(error.response);
+};
+
+/**
+ * True for a failure that comes from where the user is and what stands
+ * between them and their server, rather than from the app: no answer, a
+ * gateway that could not reach the server, or a gateway that refused the
+ * request itself or answered it with a page of its own. Logged locally,
+ * never reported.
+ */
+export const isEnvironmentError = (error: unknown): boolean =>
+  isConnectivityError(error) ||
+  isGatewayBlockError(error) ||
+  isGatewayPageError(error);
+
+export const isExpectedError = (error: unknown): boolean =>
+  error !== null &&
+  typeof error === "object" &&
+  (error as Record<symbol, unknown>)[EXPECTED_ERROR] === true;
+
+// Path segments that identify a record rather than name a route: GUIDs (with
+// or without dashes), hex hashes and bare numbers.
+const ID_SEGMENT = new RegExp(`^(?:${JELLYFIN_ID_PATTERN}|\\d+)$`, "i");
+// Anything else that isn't a plain route word (URL-encoded names, search
+// text, filenames) is a parameter too.
+const ROUTE_WORD = /^[A-Za-z][A-Za-z0-9_-]*$/;
+
+/**
+ * Reduces a request URL to its route shape: origin and query string dropped,
+ * record identifiers and free-text segments replaced by placeholders.
+ * "https://host/Users/3f2a…/Items/12?api_key=x" → "/Users/:id/Items/:id".
+ * Stable across users and items, so it can key grouping and dedupe without
+ * carrying the user's server address or what they were looking at.
+ */
+export const templateRequestPath = (url: string | undefined): string => {
+  if (!url) return "?";
+  const path = url
+    .replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, "")
+    .split(/[?#]/)[0];
+  return path
+    .split("/")
+    .map((segment) => {
+      if (segment === "") return segment;
+      if (ID_SEGMENT.test(segment)) return ":id";
+      if (!ROUTE_WORD.test(segment)) return ":param";
+      return segment;
+    })
+    .join("/");
+};
+
+export type HttpErrorDescription = {
+  method: string;
+  path: string;
+  status: number;
+};
+
+/**
+ * The route-level identity of a failed HTTP request, for grouping: an
+ * AxiosError is constructed inside axios, so its stack trace has no app
+ * frames and Sentry would otherwise file every HTTP failure in the app — any
+ * endpoint, any status, any call site — under one issue. Null when the
+ * error isn't an HTTP response (not axios, or no response at all).
+ */
+export const describeHttpError = (
+  error: unknown,
+): HttpErrorDescription | null => {
+  if (!isAxiosError(error) || !error.response) return null;
+  return {
+    method: (error.config?.method ?? "?").toUpperCase(),
+    path: templateRequestPath(error.config?.url),
+    status: error.response.status,
+  };
+};
+
+// Jellyfin's ExceptionMiddleware, for any exception outside development mode.
+// In development mode it sends the exception message instead, which can hold
+// a library path.
+const JELLYFIN_EXCEPTION_REASON = "Error processing request.";
+
+// The reasons a server gives in fixed words: the same sentence for every
+// user, so it says who answered and nothing about whom it answered. Only
+// these are quoted. A reason goes on the list once it is known to be fixed,
+// by the server's source and not by having seen it twice.
+const FIXED_RESPONSE_REASONS: ReadonlySet<string> = new Set([
+  JELLYFIN_EXCEPTION_REASON,
+]);
+
+// A top-level key that reads as a field name ("title", "traceId", "ray_id").
+// An object keyed by something the server chose (a host, a path, a name) is
+// data, and its keys do not pass.
+const FIELD_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/;
+const MAX_RESPONSE_BODY_KEYS = 12;
+// A key of the `errors` object in ASP.NET validation problem details: the
+// request parameter the server could not bind ("sortBy"), or the body field
+// ("$.PlayableMediaTypes"). Dots are not let through beyond that prefix, so a
+// host name used as a key does not pass.
+const ERROR_FIELD_NAME = /^(?:\$\.)?[A-Za-z_][A-Za-z0-9_]{0,31}$/;
+
+type ResponseBodyDescription = {
+  bodyKind: "empty" | "html" | "text" | "json" | "other";
+  /** Characters in a text or HTML body. */
+  bodyLength?: number;
+  /** The field names of a JSON object, in the order they came. */
+  bodyKeys?: string[];
+  /**
+   * The names under a JSON object's `errors`: for a 400 from Jellyfin, the
+   * parameters it rejected, which is what tells an app bug from a server one.
+   */
+  errorFields?: string[];
+  /** The body itself, only when it is one of FIXED_RESPONSE_REASONS. */
+  body?: string;
+};
+
+export type HttpResponseDescription = ResponseBodyDescription & {
+  status: number;
+  contentType?: string;
+  server?: string;
+};
+
+const describeResponseBody = (
+  data: unknown,
+  contentType: string,
+): ResponseBodyDescription => {
+  if (data === undefined || data === null || data === "") {
+    return { bodyKind: "empty" };
+  }
+  if (typeof data === "string") {
+    if (HTML_CONTENT_TYPE.test(contentType) || isHtmlDocument(data)) {
+      return { bodyKind: "html", bodyLength: data.length };
+    }
+    const reason = data.trim();
+    return {
+      bodyKind: "text",
+      bodyLength: data.length,
+      ...(FIXED_RESPONSE_REASONS.has(reason) ? { body: reason } : {}),
+    };
+  }
+  // What axios makes of a JSON body.
+  if (Array.isArray(data)) return { bodyKind: "json" };
+  if (isPlainObject(data)) {
+    const { errors } = data;
+    const errorFields = isPlainObject(errors)
+      ? Object.keys(errors)
+          .filter((key) => ERROR_FIELD_NAME.test(key))
+          .slice(0, MAX_RESPONSE_BODY_KEYS)
+      : [];
+    return {
+      bodyKind: "json",
+      bodyKeys: Object.keys(data)
+        .filter((key) => FIELD_NAME.test(key))
+        .slice(0, MAX_RESPONSE_BODY_KEYS),
+      ...(errorFields.length > 0 ? { errorFields } : {}),
+    };
+  }
+  return { bodyKind: "other" };
+};
+
+// The product a Server header opens with: "Kestrel", "nginx/1.25.3",
+// "Microsoft-IIS/10.0", the "Apache/2.4.57" of "Apache/2.4.57 (Debian)".
+// The header is free text and an admin can put the host name in it, so the
+// name has to end where a product token does: at the end of the value, a
+// space, a slash, a comment or a list separator. A dot or a colon after it
+// makes it a host ("my-host.duckdns.org", "nas:8096") and nothing matches;
+// neither does a name longer than any product's, as a cut of one would still
+// be a cut of something unknown.
+//
+// The version is kept when it is one to three numbers and left off, with the
+// name still given, when it is anything else: four numbers are an IPv4
+// address as much as a version, and whatever else follows a slash is as free
+// as the rest. Numbers that run into a colon or another slash were the start
+// of an address, a port or a path ("proxy/2001:db8::5", "proxy/192.168.1/24")
+// and are left off as well, where a suffix is not ("nginx/1.25.3-alpine").
+const SERVER_PRODUCT =
+  /^([A-Za-z][A-Za-z0-9_-]{0,31})(?=$|[\s/(,;])(?:\/(\d{1,5}(?:\.\d{1,5}){0,2})(?![.\d:/]))?/;
+
+// What stands in for a header that was sent and is not repeated, in the
+// brackets utils/sentry's scrubber marks its own cuts with. That a header was
+// there is half of what it had to say: Kestrel always names itself, so a
+// Server header that is anything else is a proxy's, and one that is missing
+// is a proxy that strips it. Leaving both out made the two read the same.
+const WITHHELD_HEADER = "[withheld]";
+
+// A header as text. axios hands over a string, or a list of them when the
+// header came more than once, which reads as its entries with commas between.
+const headerText = (header: unknown): string =>
+  header ? String(header).trim() : "";
+
+const describeServer = (header: unknown): string | undefined => {
+  const value = headerText(header);
+  if (!value) return undefined;
+  const match = SERVER_PRODUCT.exec(value);
+  if (!match) return WITHHELD_HEADER;
+  const [, name, version] = match;
+  return version ? `${name}/${version}` : name;
+};
+
+// A media type whose two halves are plain words: "text/plain",
+// "application/problem+json". No dots, which leaves the vendor types out
+// ("application/vnd.api+json") along with any host written where a subtype
+// goes; no server the app talks to answers with one.
+const MEDIA_TYPE =
+  /^([a-z0-9][a-z0-9_+-]{0,31})\/([a-z0-9][a-z0-9_+-]{0,63})(?=$|[\s;,])/i;
+
+// The charset parameter, quoted or not. This finds the text "charset="
+// wherever it stands, inside another parameter's quoted value included, so
+// what it finds is only repeated when it is one of KNOWN_CHARSETS.
+const CHARSET_PARAMETER =
+  /;\s*charset\s*=\s*"?([a-z0-9][a-z0-9_-]{0,23})"?\s*(?=$|;)/i;
+
+// The charsets a server or a proxy labels an error with. A charset is a
+// closed set of names, unlike a product, so any other word in its place is
+// free text and is left off.
+const KNOWN_CHARSETS: ReadonlySet<string> = new Set([
+  "utf-8",
+  "utf8",
+  "utf-16",
+  "us-ascii",
+  "iso-8859-1",
+  "windows-1252",
+]);
+
+// Every other parameter is dropped: a boundary or a profile is free text.
+const describeContentType = (header: unknown): string | undefined => {
+  const value = headerText(header);
+  if (!value) return undefined;
+  const mediaType = MEDIA_TYPE.exec(value);
+  if (!mediaType) return WITHHELD_HEADER;
+  const charset = CHARSET_PARAMETER.exec(
+    value.slice(mediaType[0].length),
+  )?.[1].toLowerCase();
+  return `${mediaType[1]}/${mediaType[2]}${
+    charset && KNOWN_CHARSETS.has(charset) ? `; charset=${charset}` : ""
+  }`.toLowerCase();
+};
+
+/**
+ * What the server said about a rejected request, enough to tell who answered:
+ * Jellyfin answers with `Server: Kestrel` and a text/plain reason or ASP.NET
+ * problem details, Seerr with a JSON message, a proxy with its own Server
+ * header and an HTML page.
+ *
+ * This goes to Sentry as context, so the body is described and not quoted.
+ * A body is text written by a machine the app knows nothing about: a proxy
+ * names the host it could not reach, a gateway its zone, a server the path or
+ * the name it did not find. utils/sentry's scrubDeep only knows a host by its
+ * scheme or as an IPv4 address, and nothing knows a title or a user name, so
+ * no cut of that text is safe to send. What is sent instead is the kind of
+ * body, its length, the field names of a JSON object, and the text itself
+ * only when it is one of FIXED_RESPONSE_REASONS. An HTML page counts as one
+ * under any content type, since a proxy does not always label its page.
+ *
+ * The two headers are text from the same machine and are cut down the same
+ * way: the Server header to the product it names, the content type to the
+ * media type and its charset. One that was sent and names neither is given
+ * as WITHHELD_HEADER, so that it still tells from one that was not sent.
+ */
+export const describeHttpResponse = (
+  error: unknown,
+): HttpResponseDescription | undefined => {
+  if (!isAxiosError(error) || !error.response) return undefined;
+  const headers = error.response.headers ?? {};
+  const contentType = headers["content-type"];
+  return {
+    status: error.response.status,
+    contentType: describeContentType(contentType),
+    server: describeServer(headers.server),
+    // Read against the content type as it came, not the cut of it.
+    ...describeResponseBody(error.response.data, String(contentType ?? "")),
+  };
+};
+
+type RequestQuery = { url?: string; params?: unknown } | undefined;
+
+// An escape that does not decode is kept as it came: this runs while an
+// error is being handled and must not throw.
+const decodeQueryPart = (part: string): string => {
+  try {
+    return decodeURIComponent(part.replace(/\+/g, " "));
+  } catch {
+    return part;
+  }
+};
+
+// What a request sent under one query parameter: from its url, where the SDK
+// writes it, and from the params axios appends. The name is matched in any
+// case, the way ASP.NET binds it.
+const queryValues = (config: RequestQuery, name: string): string[] => {
+  const wanted = name.toLowerCase();
+  const values: string[] = [];
+  const url = config?.url ?? "";
+  const start = url.indexOf("?");
+  const query = start === -1 ? "" : url.slice(start + 1).split("#")[0];
+  for (const pair of query.split("&")) {
+    const at = pair.indexOf("=");
+    const key = decodeQueryPart(at === -1 ? pair : pair.slice(0, at));
+    if (key.toLowerCase() !== wanted) continue;
+    values.push(at === -1 ? "" : decodeQueryPart(pair.slice(at + 1)));
+  }
+  const params = config?.params;
+  if (isPlainObject(params)) {
+    for (const [key, value] of Object.entries(params)) {
+      if (key.toLowerCase() !== wanted || value == null) continue;
+      for (const item of Array.isArray(value) ? value : [value]) {
+        values.push(String(item));
+      }
+    }
+  }
+  return values;
+};
+
+// The entries Jellyfin's CommaDelimitedCollectionModelBinder makes of what a
+// list parameter carried: a value sent once is split on commas and loses its
+// empty pieces, a parameter sent more than once gives one entry per value,
+// left whole. Each entry is trimmed before it is converted.
+const boundEntries = (values: string[]): string[] =>
+  (values.length === 1
+    ? values[0].split(",").filter((piece) => piece !== "")
+    : values
+  ).map((entry) => entry.trim());
+
+const lowerCased = (names: readonly string[]): ReadonlySet<string> =>
+  new Set(names.map((name) => name.toLowerCase()));
+
+// The names of an SDK enum, which the binder reads in any case.
+const enumNames = (values: Record<string, string>): ReadonlySet<string> =>
+  lowerCased(Object.values(values));
+
+const SORT_FIELDS = enumNames(ItemSortBy);
+const SORT_ORDERS = enumNames(SortOrder);
+const ITEM_KINDS = enumNames(BaseItemKind);
+
+// An entry that names no value of the enum fails to convert, and the binder
+// drops it without a word: only the others reach the controller, lowercased
+// here.
+const keptEnumEntries = (
+  values: string[],
+  names: ReadonlySet<string>,
+): string[] =>
+  boundEntries(values)
+    .map((entry) => entry.toLowerCase())
+    .filter((entry) => names.has(entry));
+
+// A year the binder can convert to an Int32: digits with an optional sign,
+// within range.
+const INT32_TEXT = /^[+-]?\d+$/;
+const INT32_MIN = -(2 ** 31);
+const INT32_MAX = 2 ** 31 - 1;
+
+const isInt32 = (text: string): boolean => {
+  if (!INT32_TEXT.test(text)) return false;
+  const value = Number(text);
+  return value >= INT32_MIN && value <= INT32_MAX;
+};
+
+// Routes as templateRequestPath writes them, under whatever base path the
+// server is published at ("/jellyfin"). Only route words may come before
+// them, which keeps "/Users/:id/Items" and "/Playlists/:id/Items" out.
+const ITEMS_QUERY_ROUTE = /^(?:\/[A-Za-z][\w-]*)*\/Items(?:\/Filters)?$/;
+
+// GET /Items answers faults of the request itself in the same words as an
+// unknown parent, and a request carrying one is the app's to hear about,
+// whatever its parent:
+// - a year that is not an Int32 ("NaN", "99999999999"): its converter throws
+//   an ArgumentException, which the binder lets through
+// - more sort orders than sort fields, among the entries the binder keeps.
+//   Without a sort field, GetOrderBy returns before it reads a sort order.
+// This follows Jellyfin's CommaDelimitedCollectionModelBinder and
+// RequestHelpers.GetOrderBy, alike from 10.10 to 12.2: a drift from them
+// would let a fault of the app's pass for an id the server no longer has.
+const carriesItemsQueryFault = (config: RequestQuery): boolean => {
+  const years = boundEntries(queryValues(config, "years"));
+  if (years.some((year) => !isInt32(year))) return true;
+  const sortFields = keptEnumEntries(
+    queryValues(config, "sortBy"),
+    SORT_FIELDS,
+  ).length;
+  const sortOrders = keptEnumEntries(
+    queryValues(config, "sortOrder"),
+    SORT_ORDERS,
+  ).length;
+  return sortFields > 0 && sortOrders > sortFields;
+};
+
+// The item types that, asked for alone, keep Jellyfin 10.10 and 10.11 from
+// looking the parent up: GetItems drops the parentId of a request for box
+// sets, the legacy filters skip the lookup for box sets, playlists, trailers
+// or programs. An unknown parent then answers 200, so a 400 there is about
+// something else. Jellyfin 12 looks the parent up in more of these cases,
+// but its answer does not say which version sent it, so the rule follows
+// the versions that skip the lookup.
+const PARENT_SKIPPED_ON_ITEMS = lowerCased([BaseItemKind.BoxSet]);
+const PARENT_SKIPPED_ON_FILTERS = lowerCased([
+  BaseItemKind.BoxSet,
+  BaseItemKind.Playlist,
+  BaseItemKind.Trailer,
+  BaseItemKind.Program,
+]);
+
+const skipsParentLookup = (path: string, config: RequestQuery): boolean => {
+  const kinds = keptEnumEntries(
+    queryValues(config, "includeItemTypes"),
+    ITEM_KINDS,
+  );
+  const skipping = path.endsWith("/Filters")
+    ? PARENT_SKIPPED_ON_FILTERS
+    : PARENT_SKIPPED_ON_ITEMS;
+  return kinds.length === 1 && skipping.has(kinds[0]);
+};
+
+// Guid.Empty in any form .NET reads (bare, dashed, in braces or parentheses,
+// the hex-struct form with its 0x prefixes, signs and spaces): every hex digit
+// is zero once the rest is gone. Jellyfin turns it away as a parent ("Guid
+// can't be empty") in the same words as an unknown one: a fault of the
+// request, which named no record at all. Zeros that make no GUID get
+// validation details from the server instead, so reading them as empty
+// changes nothing.
+const isEmptyGuid = (guid: string): boolean => {
+  const digits = guid.replace(/0x/gi, "").replace(/[\s{}(),+-]/g, "");
+  return /^0+$/.test(digits);
+};
+
+// ASP.NET binds a blank parentId as no parent, and reads a GUID trimmed.
+const namesParent = (id: string): boolean => {
+  const guid = id.trim();
+  return guid !== "" && !isEmptyGuid(guid);
+};
+
+/**
+ * True for a request that named a library the server no longer has: renamed
+ * or deleted, as its id follows its folder and a rename is a new id. The
+ * query cache is restored from disk for up to a day (app/_layout.tsx), so an
+ * id an earlier session saw is asked for again until a fresh list replaces
+ * it. That is the server's content moving, not a bug of the app's: never
+ * reported, never retried (utils/queryRetry.ts), and written to the local log
+ * (utils/reportDataError.ts, utils/log.tsx).
+ *
+ * Only the answer that means nothing else, as replayed against Jellyfin
+ * 10.10, 10.11 and 13: GET /Items and GET /Items/Filters answer an unknown
+ * parentId with a 400 and JELLYFIN_EXCEPTION_REASON. A parentId that is not
+ * a GUID gets validation details instead and is still reported, as is the
+ * same reason for a request that named no parent (none, a blank one, the
+ * empty GUID), one whose parent Jellyfin does not look up
+ * (skipsParentLookup), or one that carries a fault of its own
+ * (carriesItemsQueryFault).
+ *
+ * Every other 400 and 404 is still reported: a 4xx on one route is what an
+ * app bug looks like (SERVER_WIDE_CLIENT_STATUSES in constants/Sentry.ts). A
+ * series' 404 among them: Jellyfin sends it for any id that is not a series
+ * the user can see, the id of an episode included.
+ */
+export const isStaleIdError = (error: unknown): boolean => {
+  if (!isAxiosError(error)) return false;
+  const http = describeHttpError(error);
+  if (http?.method !== "GET" || http.status !== 400) return false;
+  if (!ITEMS_QUERY_ROUTE.test(http.path)) return false;
+  const body = error.response?.data;
+  return (
+    typeof body === "string" &&
+    body.trim() === JELLYFIN_EXCEPTION_REASON &&
+    queryValues(error.config, "parentId").some(namesParent) &&
+    !skipsParentLookup(http.path, error.config) &&
+    !carriesItemsQueryFault(error.config)
+  );
+};

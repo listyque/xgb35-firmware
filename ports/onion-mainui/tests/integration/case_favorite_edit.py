@@ -1,0 +1,555 @@
+# SPDX-License-Identifier: GPL-3.0-only
+"""Exercise Favorite editing through models and the real SDL popup/name UI."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+from PIL import Image
+from env import BUILD, ONION_THEME, require_onion_theme  # noqa: E402
+
+require_onion_theme()
+
+ROOT = Path(__file__).resolve().parents[2]
+# On the real-vfat run (tests/vfat.sh) the fixtures live on the FAT image.
+OUT = Path(tempfile.mkdtemp(prefix="favorite-edit-", dir=os.environ.get("MAINUI_FAT_ROOT", BUILD)))
+THEME = ONION_THEME
+
+
+def write_lines(path, rows):
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def fixture(name):
+    sd = OUT / name
+    for directory in ("Emu", "Roms", ".tmp_update/config"):
+        (sd / directory).mkdir(parents=True)
+    (sd / ".tmp_update/config/main-menu.json").write_text('{"menu":["favorites"]}')
+    games = [dict(label=label, rompath=label, type=5, keep="stock") for label in ("Zebra", "apple", "Apple", "Inside")]
+    write_lines(sd / "Roms/favourite.json", games)
+    write_lines(sd / "Roms/favourite-folders.json", [
+        dict(schema=1, generation=4, keep="header"),
+        dict(kind="folder", id="container", parent="", name="Container", order=0, keep="folder"),
+        dict(kind="folder", id="nested", parent="container", name="Nested", order=0),
+        dict(kind="item", key="Inside", type=5, folder="container", order=0, keep="assignment"),
+        dict(kind="extension", keep="opaque"),
+    ])
+    return sd
+
+
+def capture(sd, name, actions, text=None):
+    path = OUT / (name + ".bmp")
+    command = [str(BUILD / "MainUI-dev"),
+               "--sd-root", str(sd), "--theme", str(THEME), "--input", actions, "--snapshot", str(path)]
+    if text is not None:
+        command += ["--text", text]
+    subprocess.run(command, cwd=ROOT, check=True, timeout=30)
+    return Image.open(path).convert("RGB").tobytes()
+
+
+model = fixture("model")
+stock = (model / "Roms/favourite.json").read_text().splitlines(keepends=True)
+subprocess.run([str(BUILD / "fixture-favorite_edit"), str(model)], cwd=ROOT, check=True)
+# Deleting Container removed the Favorites it held (Inside, and Zebra moved
+# into it); the other lines are kept byte for byte.
+assert (model / "Roms/favourite.json").read_text().splitlines(keepends=True) == \
+    [line for line in stock if json.loads(line)["label"] not in ("Inside", "Zebra")]
+records = [json.loads(line) for line in (model / "Roms/favourite-folders.json").read_text().splitlines() if line.strip()]
+assert records[0]["keep"] == "header"
+assert not any(row.get("keep") == "assignment" for row in records)
+assert any(row.get("keep") == "opaque" for row in records)
+assert not any(row.get("id") == "container" for row in records)
+assert not any(row.get("key") in ("Inside", "Zebra") for row in records)
+
+ui = fixture("ui")
+sidecar = ui / "Roms/favourite-folders.json"
+stock = (ui / "Roms/favourite.json").read_bytes()
+baseline = sidecar.read_bytes()
+# SELECT on the first folder -> Create -> name keyboard -> START saves.
+capture(ui, "create-cancel", "ESDEB", "Cancelled")
+assert sidecar.read_bytes() == baseline
+capture(ui, "create", "ESDET", "New folder")
+rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+created = next(row for row in rows if row.get("name") == "New folder")
+assert capture(ui, "new-selected", "ESDET", "Another") != capture(ui, "root", "E")
+# First folder Rename is the third menu entry, Delete is fourth.
+capture(ui, "rename", "ESDDET", "Renamed container")
+rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+assert next(row for row in rows if row.get("id") == "container")["name"] == "Renamed container"
+assert next(row for row in rows if row.get("id") == "container")["keep"] == "folder"
+# Moving the first folder changes only its marker until Move here executes.
+before = sidecar.read_bytes()
+assert capture(ui, "cut-marker", "ESE") != capture(ui, "uncut", "E")
+assert sidecar.read_bytes() == before
+capture(ui, "cut-exit", "ESEBE")
+assert sidecar.read_bytes() == before
+# Rename failure retains the input file and keeps the name keyboard open.
+capture(ui, "duplicate", "ESDDET", "New folder")
+assert sidecar.read_bytes() == before
+(sidecar.parent / (sidecar.name + ".writing")).write_text("foreign writer")
+capture(ui, "locked-create", "ESDET", "Locked")
+assert sidecar.read_bytes() == before
+(sidecar.parent / (sidecar.name + ".writing")).unlink()
+# A damaged sidecar without a usable backup is refused and left as it is.
+backup = sidecar.parent / (sidecar.name + ".bak")
+good_backup = backup.read_bytes()
+backup.unlink()
+sidecar.write_bytes(b"{broken")
+capture(ui, "malformed-create", "ESDET", "Unsafe")
+assert sidecar.read_bytes() == b"{broken"
+assert not (sidecar.parent / (sidecar.name + ".damaged")).exists()
+# With a valid backup (what browsing shows), the edit works on the backup and
+# the damaged bytes are kept as .damaged.
+backup.write_bytes(good_backup)
+capture(ui, "malformed-create-backup", "ESDET", "Unsafe")
+assert (sidecar.parent / (sidecar.name + ".damaged")).read_bytes() == b"{broken"
+assert any(json.loads(line).get("name") == "Unsafe" for line in sidecar.read_text().splitlines())
+assert (ui / "Roms/favourite.json").read_bytes() == stock
+print("Favorite editing persistence, UI name/cancel/cut flow, unknown fields and failed-save preservation passed:", OUT)
+
+removal = fixture("remove-assignment")
+assignment = removal / "Roms/favourite-folders.json"
+with assignment.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(dict(kind="item", key="Zebra", type=5, folder="", order=0)) + "\n")
+capture(removal, "remove-assignment", "EDSDDDE")
+assert not any(json.loads(line).get("label") == "Zebra" for line in (removal / "Roms/favourite.json").read_text().splitlines())
+assert not any(json.loads(line).get("key") == "Zebra" for line in assignment.read_text().splitlines())
+print("Remove Favorite also removes its sidecar assignment")
+
+# When only the valid backup is present, browsing uses it. Removing a Favorite
+# must publish the updated assignments to the missing main file, but keep the
+# backup byte-for-byte as recovery data.
+backup_sd = fixture("remove-assignment-from-backup")
+missing_primary = backup_sd / "Roms/favourite-folders.json"
+with missing_primary.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(dict(kind="item", key="Zebra", type=5,
+                                 folder="", order=0)) + "\n")
+backup_file = backup_sd / "Roms/favourite-folders.json.bak"
+backup_bytes = missing_primary.read_bytes()
+backup_file.write_bytes(backup_bytes)
+missing_primary.unlink()
+capture(backup_sd, "remove-assignment-from-backup", "EDSDDDE")
+assert missing_primary.exists(), "assignment removal did not publish the primary"
+assert backup_file.read_bytes() == backup_bytes, "recovery backup was modified"
+assert not any(json.loads(line).get("key") == "Zebra" for line in
+               missing_primary.read_text().splitlines())
+print("Favorite assignment removal uses backup when primary is absent")
+
+keyboard = fixture("keyboard")
+capture(keyboard, "keyboard-blank", "ESDE", "")
+capture(keyboard, "keyboard-text", "ESDE", "Readable")
+blank = Image.open(OUT / "keyboard-blank.bmp").convert("RGB")
+filled = Image.open(OUT / "keyboard-text.bmp").convert("RGB")
+assert blank.crop((40, 66, 600, 114)).tobytes() != filled.crop((40, 66, 600, 114)).tobytes()
+assert filled.getpixel((80, 130)) == (0, 0, 0), "Eight-pixel gap after the first 52px key"
+assert filled.getpixel((25, 127)) != filled.getpixel((80, 130)), "First key starts at (24,126)"
+print("Recovered keyboard field contrast and key geometry passed")
+
+
+# An edit saves the repair browsing shows, but keeps the damaged original
+# once as .damaged, which later edits never replace (review of 1.0.2, finding 2).
+def create_once(sd, name):
+    return subprocess.run([str(BUILD / "fixture-favorite_edit"), str(sd), "create", name],
+                          cwd=ROOT, capture_output=True, text=True, timeout=30)
+
+def names_in(path):
+    return [json.loads(line).get("name") for line in path.read_text().splitlines()]
+
+header = dict(schema=1, generation=0)
+damaged = {
+    "missing-name": [dict(kind="folder", id="a", parent="", name="A", order=0),
+                     dict(kind="folder", id="b", parent="", order=1)],
+    "duplicate-id": [dict(kind="folder", id="a", parent="", name="A", order=0),
+                     dict(kind="folder", id="a", parent="", name="Other", order=1)],
+    "cycle": [dict(kind="folder", id="a", parent="b", name="A", order=0),
+              dict(kind="folder", id="b", parent="a", name="B", order=0)],
+    "too-deep": [dict(kind="folder", id=f"d{i}", parent=f"d{i - 1}" if i else "", name=f"D{i}",
+                      order=0) for i in range(4)],
+    "dangling-parent": [dict(kind="folder", id="a", parent="gone", name="A", order=0)],
+    "numeric-parent": [dict(kind="folder", id="a", parent=7, name="A", order=0)],
+    "dangling-assignment": [dict(kind="folder", id="a", parent="", name="A", order=0),
+                            dict(kind="item", key="Zebra", type=5, folder="gone", order=0)],
+    "conflicting-assignment": [dict(kind="item", key="Zebra", type=5, folder="", order=0),
+                               dict(kind="item", key="Zebra", type=5, folder="", order=3)],
+    # Same folder and order, but other fields differ: only the first survives.
+    "duplicate-extra-fields": [
+        dict(kind="item", key="Zebra", type=5, folder="", order=0, note="first"),
+        dict(kind="item", key="Zebra", type=5, folder="", order=0, note="second")],
+    "duplicate-field-in-second": [
+        dict(kind="item", key="Zebra", type=5, folder="", order=0),
+        dict(kind="item", key="Zebra", type=5, folder="", order=0, note="only here")],
+}
+for name, rows in damaged.items():
+    sd = fixture("damaged-" + name)
+    sidecar = sd / "Roms/favourite-folders.json"
+    write_lines(sidecar, [header] + rows)
+    original = sidecar.read_bytes()
+    kept = sd / "Roms/favourite-folders.json.damaged"
+    result = create_once(sd, "Unrelated")
+    assert result.returncode == 0, (name, result.stdout)
+    assert kept.read_bytes() == original, name
+    assert "Unrelated" in names_in(sidecar), name
+    # Now repaired: a later edit leaves the kept original alone.
+    assert create_once(sd, "Later").returncode == 0
+    assert kept.read_bytes() == original and "Later" in names_in(sidecar), name
+    assert not list(sd.glob("Roms/*.damaged-*")), name
+
+# Fresh damage with an older, different copy already kept: both originals survive.
+sidecar.write_bytes(original.replace(b'"generation": 0', b'"generation": 7'))
+second = sidecar.read_bytes()
+assert create_once(sd, "Again").returncode == 0
+assert kept.read_bytes() == original
+assert (sd / "Roms/favourite-folders.json.damaged-7").read_bytes() == second
+
+# If no copy can be kept, nothing is saved.
+sd = fixture("damaged-unkeepable")
+sidecar = sd / "Roms/favourite-folders.json"
+write_lines(sidecar, [header] + damaged["cycle"])
+before = sidecar.read_bytes()
+(sd / "Roms/favourite-folders.json.damaged").mkdir()
+result = create_once(sd, "Unrelated")
+assert result.returncode == 1 and "copy of the damaged" in result.stdout, result.stdout
+assert sidecar.read_bytes() == before
+
+# A damaged sidecar whose .bak is valid (browsing already shows the backup):
+# editing keeps the damaged bytes as .damaged, then works on the backup.
+sd = fixture("damaged-with-backup")
+sidecar = sd / "Roms/favourite-folders.json"
+backup = sd / "Roms/favourite-folders.json.bak"
+backup.write_bytes(sidecar.read_bytes())
+broken = b'{"schema":1,"generation":3}\n{"kind":"folder",broken\n'
+sidecar.write_bytes(broken)
+assert create_once(sd, "Unrelated").returncode == 0
+assert (sd / "Roms/favourite-folders.json.damaged").read_bytes() == broken
+names = set(names_in(sidecar))
+assert {"Container", "Nested", "Unrelated"} <= names, names
+# A main file that cannot be read as text at all (NUL bytes, as a power cut on
+# FAT can leave, or over the 8 MiB limit) is moved aside unchanged, never
+# replacing a kept copy, and editing works on the valid backup. A read error
+# is not damage: an unreadable main file (here a folder) still stops the edit.
+for name, content in (("nul", b"\x00" * 4096), ("oversize", b" " * (8 * 1024 * 1024 + 1))):
+    sd = fixture(f"unreadable-{name}")
+    sidecar = sd / "Roms/favourite-folders.json"
+    backup = sd / "Roms/favourite-folders.json.bak"
+    backup.write_bytes(sidecar.read_bytes())
+    sidecar.write_bytes(content)
+    earlier = sd / "Roms/favourite-folders.json.damaged"
+    earlier.write_bytes(b"an earlier copy")
+    assert create_once(sd, "Unrelated").returncode == 0
+    assert earlier.read_bytes() == b"an earlier copy"
+    kept = [p for p in sd.glob("Roms/favourite-folders.json.damaged-*")]
+    assert len(kept) == 1 and kept[0].read_bytes() == content, kept
+    assert {"Container", "Nested", "Unrelated"} <= set(names_in(sidecar))
+sd = fixture("unreadable-folder")
+sidecar = sd / "Roms/favourite-folders.json"
+(sd / "Roms/favourite-folders.json.bak").write_bytes(sidecar.read_bytes())
+sidecar.unlink()
+sidecar.mkdir()
+assert create_once(sd, "Unrelated").returncode != 0
+assert sidecar.is_dir() and not list(sd.glob("Roms/*.damaged*"))
+# A newer schema is not damage: refused as before, nothing changed or kept.
+sd = fixture("newer-schema-with-backup")
+sidecar = sd / "Roms/favourite-folders.json"
+(sd / "Roms/favourite-folders.json.bak").write_bytes(sidecar.read_bytes())
+newer = b'{"schema":2,"generation":0}\n'
+sidecar.write_bytes(newer)
+assert create_once(sd, "Unrelated").returncode == 1
+assert sidecar.read_bytes() == newer
+assert not (sd / "Roms/favourite-folders.json.damaged").exists()
+
+# Records the reader takes exactly as written stay editable: an agreeing
+# repeated assignment, a folder without order, an over-long path (above).
+sd = fixture("agreeing")
+sidecar = sd / "Roms/favourite-folders.json"
+write_lines(sidecar, [header, dict(kind="folder", id="a", parent="", name="A"),
+                      dict(kind="item", key="Zebra", type=5, folder="a", order=0),
+                      dict(kind="item", key="Zebra", type=5, folder="a", order=0)])
+assert create_once(sd, "Unrelated").returncode == 0
+assert any(json.loads(line).get("name") == "Unrelated" for line in sidecar.read_text().splitlines())
+assert not list(sd.glob("Roms/*.damaged*"))
+
+# With only the backup left, edits work on that whole document: its header,
+# unknown fields, other record kinds, assignments of games no longer listed
+# and its generation survive the first edit, which leaves the .bak as it is,
+# and the second, which backs up the first (audit A1).
+sd = fixture("backup-only")
+sidecar = sd / "Roms/favourite-folders.json"
+backup = sd / "Roms/favourite-folders.json.bak"
+with sidecar.open("a", encoding="utf-8") as orphan:
+    orphan.write(json.dumps(dict(kind="item", key="Gone", type=5, folder="container", order=3,
+                                 keep="orphan")) + "\n")
+sidecar.rename(backup)
+saved = backup.read_bytes()
+
+
+def kept(path):
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    return rows[0]["generation"], {row.get("keep") for row in rows}
+
+
+for edit, name in enumerate(("Unrelated", "Second")):
+    assert create_once(sd, name).returncode == 0
+    names = {json.loads(line).get("name") for line in sidecar.read_text().splitlines()}
+    assert {"Container", "Nested", "Unrelated", name} <= names, names
+    generation, keeps = kept(sidecar)
+    assert generation == 5 + edit, generation
+    assert {"header", "folder", "assignment", "opaque", "orphan"} <= keeps, keeps
+    if not edit:
+        assert backup.read_bytes() == saved
+generation, keeps = kept(backup)  # the first edit's result, metadata included
+assert generation == 5 and "orphan" in keeps, (generation, keeps)
+assert not list(sd.glob("Roms/*.damaged*"))
+# A .bak that is no usable document is kept as .damaged before the first
+# edit replaces what browsing shows; one that cannot be read stops the edit.
+sd = fixture("backup-damaged")
+sidecar = sd / "Roms/favourite-folders.json"
+backup = sd / "Roms/favourite-folders.json.bak"
+sidecar.unlink()
+backup.write_bytes(b'{"schema":1,"generation":2}\n{broken\n')
+assert create_once(sd, "Fresh").returncode == 0
+assert (sd / "Roms/favourite-folders.json.damaged").read_bytes() == backup.read_bytes()
+# Only a backup, of a newer schema: refused too, with no main file made from
+# what MainUI could show and no .damaged copy (review C2).
+sd = fixture("backup-newer-schema")
+sidecar = sd / "Roms/favourite-folders.json"
+backup = sd / "Roms/favourite-folders.json.bak"
+sidecar.unlink()
+backup.write_bytes(b'{"schema":2,"generation":0}\n{"kind":"folder","id":"x"}\n')
+saved = backup.read_bytes()
+assert create_once(sd, "Fresh").returncode == 1
+assert not sidecar.exists() and backup.read_bytes() == saved
+assert not list(sd.glob("Roms/*.damaged*"))
+sd = fixture("backup-unreadable")
+sidecar = sd / "Roms/favourite-folders.json"
+backup = sd / "Roms/favourite-folders.json.bak"
+sidecar.unlink()
+backup.mkdir()
+assert create_once(sd, "Fresh").returncode != 0
+assert not sidecar.exists()
+print("Repairs keep the damaged original once; agreeing and backup-only sidecars stay as they are")
+
+
+# Deleting a folder removes all it holds: its folders at any depth, their
+# assignments and their Favorites, which leave favourite.json; nothing
+# outside it changes, a same-named folder beside it included.
+def delete_once(sd, folder_id):
+    return subprocess.run([str(BUILD / "fixture-favorite_edit"), str(sd), "delete", folder_id],
+                          cwd=ROOT, capture_output=True, text=True, timeout=30)
+
+sd = fixture("delete-subtree")
+sidecar = sd / "Roms/favourite-folders.json"
+favourites = sd / "Roms/favourite.json"
+write_lines(sidecar, [header,
+                      dict(kind="folder", id="a", parent="", name="A", order=0),
+                      dict(kind="folder", id="x", parent="", name="X", order=1),
+                      dict(kind="folder", id="ax", parent="a", name="X", order=0),
+                      dict(kind="folder", id="axy", parent="ax", name="Y", order=0),
+                      dict(kind="item", key="Zebra", type=5, folder="axy", order=0),
+                      dict(kind="item", key="apple", type=5, folder="a", order=0),
+                      dict(kind="item", key="Inside", type=5, folder="x", order=0)])
+stock = favourites.read_text().splitlines(keepends=True)
+result = delete_once(sd, "a")
+assert result.returncode == 0, result.stdout
+rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+assert {row["id"] for row in rows if "id" in row} == {"x"}, rows
+assert not any(row.get("key") in ("Zebra", "apple") for row in rows), rows
+assert next(row for row in rows if row.get("key") == "Inside")["folder"] == "x", rows
+assert favourites.read_text().splitlines(keepends=True) == \
+    [line for line in stock if json.loads(line)["label"] not in ("Zebra", "apple")]
+# An empty folder goes alone; the Favorites file is not rewritten.
+sd = fixture("delete-empty")
+sidecar = sd / "Roms/favourite-folders.json"
+write_lines(sidecar, [header, dict(kind="folder", id="e", parent="", name="Empty", order=0)])
+stock = (sd / "Roms/favourite.json").read_bytes()
+assert delete_once(sd, "e").returncode == 0
+assert not any("id" in json.loads(line) for line in sidecar.read_text().splitlines())
+assert (sd / "Roms/favourite.json").read_bytes() == stock
+
+# In MainUI, Delete folder asks first, with stock's labels; B keeps all.
+ui = fixture("delete-ui")
+sidecar = ui / "Roms/favourite-folders.json"
+favourites = ui / "Roms/favourite.json"
+before, games = sidecar.read_bytes(), favourites.read_bytes()
+# Favorites, Select on Container, Down to Delete (fourth), A: the question.
+asked = capture(ui, "delete-ask", "ESDDDE")
+assert asked != capture(ui, "delete-root", "E")
+capture(ui, "delete-cancel", "ESDDDEB")
+assert sidecar.read_bytes() == before and favourites.read_bytes() == games
+capture(ui, "delete-held", "ESDDDEEEE")  # A held: repeats only
+assert sidecar.read_bytes() == before and favourites.read_bytes() == games
+capture(ui, "delete-confirm", "ESDDDE-EE")
+assert not any(json.loads(line).get("id") in ("container", "nested")
+               for line in sidecar.read_text().splitlines())
+assert [json.loads(line)["label"] for line in favourites.read_text().splitlines()] == \
+    ["Zebra", "apple", "Apple"]
+
+# If the Favorites list cannot be rewritten (here a leftover reservation), the
+# folders are still deleted and the games kept, listed at the top; MainUI says
+# so, and once that is dismissed the open folder's list fits what is left.
+sd = fixture("delete-games-kept")
+write_lines(sd / "Roms/favourite-folders.json", [
+    dict(schema=1, generation=0),
+    dict(kind="folder", id="p", parent="", name="Parent", order=0),
+    dict(kind="folder", id="c", parent="p", name="Child", order=0),
+    dict(kind="item", key="Inside", type=5, folder="c", order=0)])
+favourites = sd / "Roms/favourite.json"
+games = favourites.read_bytes()
+(sd / "Roms/favourite.json.writing").write_text("foreign writer")
+# Open Parent, Down to Child, Delete, confirm, then dismiss the warning.
+dismissed = capture(sd, "kept-dismissed", "EE" + "D" + "SDDDE" + "-EE" + "-EE")
+assert favourites.read_bytes() == games
+rows = [json.loads(line) for line in (sd / "Roms/favourite-folders.json").read_text().splitlines()]
+assert [row["id"] for row in rows if "id" in row] == ["p"], rows
+assert not any(row.get("key") == "Inside" for row in rows), rows
+# Parent now holds only "..": the same as opening it afresh.
+assert capture(sd, "kept-reopened", "EE") == dismissed
+print("Deleting a folder asks first, then removes its folders and Favorites; "
+      "kept games are reported and the list refitted")
+
+
+# Paste keeps the visible window when the moved Favorite stays inside it and
+# otherwise scrolls only as far as needed, like moving the cursor there.
+def window_case(name, ups):
+    sd = fixture(name)
+    write_lines(sd / "Roms/favourite.json",
+                [dict(label=f"Game {i:02}", rompath=f"/mnt/SDCARD/Roms/FC/{i:02}.nes", type=5)
+                 for i in range(20)])
+    (sd / "Roms/favourite-folders.json").unlink(missing_ok=True)
+    # Wrap to the last game, Move it up `ups` rows, Paste.
+    moved = capture(sd, name + "-moved", "EU" + "SE" + "U" * ups + "SE")
+    # The same list and cursor, reached by navigation alone.
+    assert capture(sd, name + "-navigated", "EU" + "U" * ups) == moved, name
+
+window_case("paste-within-window", 3)
+window_case("paste-above-window", 9)
+
+# Between folders the list sizes change on both sides (review of v6). Root
+# shows folders first, then games; a folder opens on its ".." row.
+def folder_fixture(name, inside):
+    sd = fixture(name)
+    write_lines(sd / "Roms/favourite.json",
+                [dict(label=f"Game {i:02}", rompath=f"/mnt/SDCARD/Roms/FC/{i:02}.nes", type=5)
+                 for i in range(3 + inside)])
+    write_lines(sd / "Roms/favourite-folders.json",
+                [dict(schema=1, generation=0), dict(kind="folder", id="f", parent="", name="Folder",
+                                                     order=0)] +
+                [dict(kind="item", key=f"/mnt/SDCARD/Roms/FC/{i:02}.nes", type=5, folder="f",
+                      order=i - 3) for i in range(3, 3 + inside)])
+    return sd
+
+def folder_case(name, inside, downs):
+    # Move the last root game, open Folder (Down wraps to it), step down, Paste.
+    paste = "EDDDSEDE" + "D" * downs + "SE"
+    sd = folder_fixture(name, inside)
+    moved = capture(sd, name + "-moved", paste)
+    # The pasted game's row in the folder, after "..", from the saved order.
+    rows = [json.loads(line) for line in
+            (sd / "Roms/favourite-folders.json").read_text().splitlines()]
+    inside_rows = sorted((row for row in rows if row.get("folder") == "f"),
+                         key=lambda row: row["order"])
+    row = 1 + [row["key"] for row in inside_rows].index("/mnt/SDCARD/Roms/FC/02.nes")
+    assert len(inside_rows) == inside + 1 and row in (downs, downs + 1), (name, row)
+    assert capture(sd, name + "-navigated", "EE" + "D" * row) == moved, name
+    # Back at the root in the same session, one game fewer: as if freshly opened.
+    sd = folder_fixture(name + "-back", inside)
+    back = capture(sd, name + "-back", paste + "B")
+    assert capture(sd, name + "-root", "E") == back, name
+
+folder_case("paste-into-empty-folder", 0, 0)
+folder_case("paste-into-long-folder", 10, 2)
+folder_case("paste-into-long-folder-end", 10, 9)
+print("Paste keeps the list window unless the moved Favorite leaves it")
+
+
+# A game pasted on a folder goes into it, after its games; the cursor stays on
+# the folder and the list does not move. A folder pasted on a folder still
+# takes its place instead, and paste on ".." stays in the open folder (above).
+def inside_keys(sd, folder="f"):
+    rows = [json.loads(line) for line in
+            (sd / "Roms/favourite-folders.json").read_text().splitlines()]
+    return [row["key"] for row in sorted((row for row in rows if row.get("folder") == folder),
+                                         key=lambda row: row["order"])]
+
+for name, inside in (("drop-into-empty-folder", 0), ("drop-into-long-folder", 10)):
+    sd = folder_fixture(name, inside)
+    # Move the last root game, Down wraps to Folder, Paste on it.
+    dropped = capture(sd, name, "EDDDSE" + "D" + "SE")
+    keys = inside_keys(sd)
+    assert len(keys) == inside + 1 and keys[-1] == "/mnt/SDCARD/Roms/FC/02.nes", (name, keys)
+    assert keys[:-1] == [f"/mnt/SDCARD/Roms/FC/{i:02}.nes" for i in range(3, 3 + inside)]
+    assert capture(sd, name + "-reopened", "E") == dropped, name
+    # Opening it in the same session shows the game as its last row.
+    sd = folder_fixture(name + "-open", inside)
+    opened = capture(sd, name + "-open", "EDDDSEDSE" + "E" + "U")
+    assert capture(sd, name + "-open-navigated", "EE" + "U") == opened, name
+
+# A game dropped on the folder it was cut from, where it would change
+# nothing, moves up into the open folder, after its games (#30).
+def assignments(sd):
+    return {row["key"]: row for row in map(json.loads,
+            (sd / "Roms/favourite-folders.json").read_text().splitlines()) if "key" in row}
+
+sd = folder_fixture("drop-own-folder", 3)
+capture(sd, "drop-own-folder", "EE" + "D" + "SE" + "B" + "SE")
+assert inside_keys(sd) == [f"/mnt/SDCARD/Roms/FC/{i:02}.nes" for i in (4, 5)], inside_keys(sd)
+assert inside_keys(sd, "") == [f"/mnt/SDCARD/Roms/FC/{i:02}.nes" for i in (0, 1, 2, 3)], \
+    inside_keys(sd, "")
+
+# The reported case: Favorites holds one folder and nothing else, so its only
+# game has no other row to be pasted on at the root.
+sd = fixture("only-game-up")
+write_lines(sd / "Roms/favourite.json",
+            [dict(label="Mario", rompath="/mnt/SDCARD/Roms/FC/00.nes", type=5)])
+write_lines(sd / "Roms/favourite-folders.json",
+            [dict(schema=1, generation=0),
+             dict(kind="folder", id="f", parent="", name="Platformers", order=0),
+             dict(kind="item", key="/mnt/SDCARD/Roms/FC/00.nes", type=5, folder="f", order=0)])
+# Open Favorites and Platformers, Move Mario, back (Platformers selected), Paste.
+moved = capture(sd, "only-game-up", "EE" + "D" + "SE" + "B" + "SE")
+assert assignments(sd)["/mnt/SDCARD/Roms/FC/00.nes"]["folder"] == "", assignments(sd)
+assert inside_keys(sd) == []
+assert capture(sd, "only-game-up-reopened", "E" + "D") == moved
+
+# Between sibling folders a game still goes into the folder it is pasted on.
+def siblings(name):
+    sd = fixture(name)
+    write_lines(sd / "Roms/favourite.json",
+                [dict(label=f"Game {i:02}", rompath=f"/mnt/SDCARD/Roms/FC/{i:02}.nes", type=5)
+                 for i in range(3)])
+    write_lines(sd / "Roms/favourite-folders.json",
+                [dict(schema=1, generation=0),
+                 dict(kind="folder", id="f", parent="", name="First", order=0),
+                 dict(kind="folder", id="g", parent="", name="Second", order=1)] +
+                [dict(kind="item", key=f"/mnt/SDCARD/Roms/FC/{i:02}.nes", type=5, folder="f",
+                      order=i) for i in range(3)])
+    return sd
+
+sd = siblings("sibling-folder")
+# Open First, Move Game 00, back (First selected), Down to Second, Paste.
+capture(sd, "sibling-folder", "EE" + "D" + "SE" + "B" + "D" + "SE")
+assert inside_keys(sd) == [f"/mnt/SDCARD/Roms/FC/{i:02}.nes" for i in (1, 2)], inside_keys(sd)
+assert inside_keys(sd, "g") == ["/mnt/SDCARD/Roms/FC/00.nes"], inside_keys(sd, "g")
+
+# Pasted on another game in the folder it was cut from, it only moves there.
+sd = siblings("within-folder")
+# Open First, Move Game 00, Down to Game 02, Paste.
+capture(sd, "within-folder", "EE" + "D" + "SE" + "DD" + "SE")
+assert sorted(inside_keys(sd)) == [f"/mnt/SDCARD/Roms/FC/{i:02}.nes" for i in range(3)]
+assert inside_keys(sd)[0] != "/mnt/SDCARD/Roms/FC/00.nes", inside_keys(sd)
+assert inside_keys(sd, "g") == [] and inside_keys(sd, "") == []
+
+# A folder pasted on a folder takes its place; nothing goes inside.
+sd = fixture("folder-on-folder")
+write_lines(sd / "Roms/favourite.json",
+            [dict(label="Game", rompath="/mnt/SDCARD/Roms/FC/00.nes", type=5)])
+write_lines(sd / "Roms/favourite-folders.json",
+            [dict(schema=1, generation=0),
+             dict(kind="folder", id="a", parent="", name="A", order=0),
+             dict(kind="folder", id="b", parent="", name="B", order=1)])
+capture(sd, "folder-on-folder", "E" + "D" + "SE" + "U" + "SE")
+rows = {row["id"]: row for row in map(json.loads,
+        (sd / "Roms/favourite-folders.json").read_text().splitlines()) if "id" in row}
+assert rows["a"]["parent"] == rows["b"]["parent"] == "", rows
+assert rows["b"]["order"] < rows["a"]["order"], rows
+print("A game pasted on a folder goes into it, last, or up a level when cut from it; "
+      "a folder pasted on one takes its place")

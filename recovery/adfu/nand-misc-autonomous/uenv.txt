@@ -1,0 +1,2 @@
+uenvcmd=setenv os_type linux;
+bootargs.add=rdinit=/init clk_ignore_unused

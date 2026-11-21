@@ -1,0 +1,198 @@
+{
+  "name": "streamyfin",
+  "main": "./index",
+  "version": "1.0.0",
+  "scripts": {
+    "clean": "echo y | expo prebuild --clean",
+    "start": "expo start",
+    "prebuild": "cross-env EXPO_TV=0 bun run clean",
+    "prebuild:tv": "cross-env EXPO_TV=1 bun run clean",
+    "ios:install-metal-toolchain": "bash scripts/ios/install-metal-toolchain.sh",
+    "ios": "cross-env EXPO_TV=0 expo run:ios",
+    "ios:tv": "cross-env EXPO_TV=1 expo run:ios",
+    "android": "cross-env EXPO_TV=0 expo run:android",
+    "android:tv": "cross-env EXPO_TV=1 expo run:android",
+    "build:android:local": "cd android && cross-env NODE_ENV=production ./gradlew assembleRelease",
+    "ios:unsigned-build": "cross-env EXPO_TV=0 bun scripts/ios/build-ios.ts --production",
+    "ios:unsigned-build:tv": "cross-env EXPO_TV=1 bun scripts/ios/build-ios.ts --production",
+    "prepare": "husky",
+    "typecheck": "bun scripts/typecheck.ts",
+    "check": "biome check . --max-diagnostics 1000",
+    "lint": "biome check --write --unsafe --max-diagnostics 1000",
+    "format": "biome format --write .",
+    "doctor": "expo-doctor",
+    "i18n:check": "bun scripts/check-i18n-keys.ts",
+    "i18n:fix-unused": "bun scripts/check-i18n-keys.ts --fix-unused",
+    "test:unit": "jest",
+    "test:coverage": "jest --coverage",
+    "e2e:smoke": "python3 e2e/bench/maestro.py --flow e2e/suites/cast/flows/smoke-launch.yml",
+    "e2e:bench:test": "python3 -m unittest discover -s e2e -t e2e",
+    "test": "bun run typecheck && bun run test:unit && bun run e2e:bench:test && bun run lint && bun run format && bun run i18n:check && bun run doctor",
+    "seerr:types": "bun run scripts/seerr/generate-types.ts",
+    "seerr:capture": "bun run scripts/seerr/capture.ts",
+    "perf": "reassure -- --config jest.perf.config.js",
+    "perf:baseline": "reassure --baseline -- --config jest.perf.config.js",
+    "perf:baseline:branch": "bun scripts/reassure-baseline.ts"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
+  },
+  "dependencies": {
+    "@douglowder/expo-av-route-picker-view": "^0.0.5",
+    "@expo/metro-runtime": "~58.0.17",
+    "@expo/react-native-action-sheet": "^4.1.1",
+    "@expo/ui": "~58.0.27",
+    "@expo/vector-icons": "^15.1.1",
+    "@gorhom/bottom-sheet": "5.2.14",
+    "@jellyfin/sdk": "1.0.2",
+    "@react-native-community/netinfo": "12.0.1",
+    "@react-navigation/native": "7.5.1",
+    "@sentry/react-native": "^8.33.0",
+    "@shopify/flash-list": "2.3.3",
+    "@tanstack/query-sync-storage-persister": "5.107.1",
+    "@tanstack/react-query": "5.107.1",
+    "@tanstack/react-query-persist-client": "5.107.1",
+    "axios": "1.21.1",
+    "eventemitter3": "^5.0.4",
+    "expo": "58.0.23",
+    "expo-application": "~58.1.2",
+    "expo-asset": "~58.0.20",
+    "expo-audio": "~58.0.11",
+    "expo-background-task": "~58.0.12",
+    "expo-blur": "~58.0.5",
+    "expo-brightness": "~58.0.2",
+    "expo-build-properties": "~58.0.12",
+    "expo-camera": "~58.0.14",
+    "expo-clipboard": "~58.0.4",
+    "expo-constants": "~58.0.15",
+    "expo-crypto": "~58.0.7",
+    "expo-dev-client": "~58.0.18",
+    "expo-device": "~58.0.5",
+    "expo-file-system": "~58.0.13",
+    "expo-font": "~58.0.11",
+    "expo-glass-effect": "~58.0.5",
+    "expo-haptics": "~58.0.7",
+    "expo-image": "~58.0.18",
+    "expo-key-event": "^1.9.0",
+    "expo-linear-gradient": "~58.0.3",
+    "expo-linking": "~58.0.16",
+    "expo-localization": "~58.0.5",
+    "expo-location": "~58.0.20",
+    "expo-notifications": "~58.1.8",
+    "expo-router": "~58.0.30",
+    "expo-screen-orientation": "~58.0.4",
+    "expo-secure-store": "~58.0.2",
+    "expo-sharing": "~58.0.22",
+    "expo-splash-screen": "~58.0.13",
+    "expo-symbols": "~58.0.4",
+    "expo-task-manager": "~58.0.13",
+    "expo-web-browser": "~58.0.7",
+    "i18next": "27.1.1",
+    "jotai": "3.0.2",
+    "lodash": "4.18.1",
+    "nativewind": "^2.0.11",
+    "react": "19.3.0",
+    "react-i18next": "18.0.1",
+    "react-native": "npm:react-native-tvos@0.88.1-0",
+    "react-native-awesome-slider": "^2.9.0",
+    "react-native-drax": "1.1.0",
+    "react-native-edge-to-edge": "1.8.2",
+    "react-native-gesture-handler": "3.5.0",
+    "react-native-google-cast": "^4.9.1",
+    "react-native-image-colors": "2.6.1",
+    "react-native-mmkv": "4.3.2",
+    "react-native-nitro-modules": "0.37.2",
+    "react-native-pager-view": "10.0.0",
+    "react-native-qrcode-svg": "^6.3.49",
+    "react-native-reanimated": "4.7.1",
+    "react-native-safe-area-context": "5.11.1",
+    "react-native-screens": "4.30.1",
+    "react-native-svg": "15.16.1",
+    "react-native-tab-view": "4.3.4",
+    "react-native-text-ticker": "1.16.0",
+    "react-native-track-player": "github:lovegaoshi/react-native-track-player#d371784",
+    "react-native-udp": "^4.1.7",
+    "react-native-worklets": "0.13.1",
+    "sonner-native": "0.27.0",
+    "tailwindcss": "3.3.2"
+  },
+  "devDependencies": {
+    "@babel/core": "7.29.13",
+    "@biomejs/biome": "2.6.6",
+    "@expo/repack-app": "0.10.4",
+    "@react-native-tvos/config-tv": "0.1.7",
+    "@react-native/jest-preset": "0.88.1",
+    "@testing-library/react-native": "14.1.0",
+    "@types/bun": "1.4.4",
+    "@types/jest": "30.0.0",
+    "@types/lodash": "4.17.27",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "axios-mock-adapter": "2.1.0",
+    "cross-env": "10.1.0",
+    "expo-doctor": "1.21.5",
+    "husky": "9.1.7",
+    "ignore": "7.0.14",
+    "jest": "30.5.2",
+    "jest-expo": "~58.0.14",
+    "lint-staged": "17.6.0",
+    "openapi-typescript": "7.13.0",
+    "reassure": "1.6.1",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3"
+  },
+  "expo": {
+    "autolinking": {
+      "android": {
+        "buildFromSource": [
+          "expo-image"
+        ]
+      }
+    },
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "react-native-google-cast",
+          "react-native-udp",
+          "react-native-track-player",
+          "@jellyfin/sdk",
+          "react-native-edge-to-edge"
+        ],
+        "listUnknownPackages": false
+      }
+    },
+    "install": {
+      "exclude": [
+        "react-native",
+        "react-native-screens",
+        "react-native-reanimated",
+        "react-native-worklets",
+        "@shopify/flash-list",
+        "react-native-pager-view",
+        "react-native-safe-area-context",
+        "react-native-svg",
+        "@sentry/react-native",
+        "react-native-gesture-handler"
+      ]
+    }
+  },
+  "private": true,
+  "lint-staged": {
+    "*.{js,jsx,ts,tsx}": [
+      "biome check --write --unsafe --no-errors-on-unmatched"
+    ],
+    "*.json": [
+      "biome format --write"
+    ]
+  },
+  "trustedDependencies": [
+    "@sentry/cli",
+    "unrs-resolver"
+  ],
+  "patchedDependencies": {
+    "react-native-udp@4.1.7": "patches/react-native-udp@4.1.7.patch",
+    "react-native-track-player@github:lovegaoshi/react-native-track-player#d371784": "patches/react-native-track-player@4.1.1.patch",
+    "react-native-google-cast@4.9.1": "patches/react-native-google-cast@4.9.1.patch",
+    "react-native-drax@1.1.0": "patches/react-native-drax@1.1.0.patch"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "event": "die",
+  "r0": "0xc05e10e4",
+  "r2": "0x5",
+  "pc": "0xc01e4980",
+  "dfar": "0x4",
+  "dfsr": "0x5",
+  "ifsr": "0x1002",
+  "r1": "0xc4180560",
+  "lr": "0xc01e7ae8",
+  "headless": true,
+  "rom_return": true,
+  "argument": "Oops"
+}

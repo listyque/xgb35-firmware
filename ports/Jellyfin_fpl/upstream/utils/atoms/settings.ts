@@ -1,0 +1,1220 @@
+// pluginSettingsAtom reads the stored plugin settings with storage.get while
+// this module loads, and nothing else this file imports adds that method.
+import "@/augmentations/mmkv";
+import {
+  type BaseItemKind,
+  type CultureDto,
+  type ItemFilter,
+  type ItemSortBy,
+  type SortOrder,
+  SubtitlePlaybackMode,
+} from "@jellyfin/sdk/lib/generated-client";
+import { isAxiosError } from "axios";
+import { atom, useAtom, useAtomValue, useStore } from "jotai";
+import { useCallback, useEffect } from "react";
+import { Platform } from "react-native";
+import {
+  BITRATE_DETECTION_TTL_MS,
+  DETECTED_BITRATE_RATIO,
+  IN_NETWORK_MIN_BITRATE,
+} from "@/constants/Bitrate";
+import {
+  DEFAULT_MUSIC_NORMALIZATION_MODE,
+  type MusicNormalizationMode,
+} from "@/constants/Music";
+import type { Bitrate } from "@/constants/Playback";
+import { REDACTED_PLACEHOLDER } from "@/constants/Privacy";
+import {
+  DEFAULT_STILL_WATCHING_PRESET,
+  type StillWatchingPreset,
+} from "@/constants/StillWatching";
+import * as ScreenOrientation from "@/packages/expo-screen-orientation";
+import { apiAtom } from "@/utils/atoms/api";
+import { AUTO_BITRATE, PLAYBACK_BITRATES } from "@/utils/bitrate";
+import { isExpectedError } from "@/utils/errors";
+import { logAndCaptureError, writeInfoLog } from "@/utils/log";
+import {
+  coerceStillWatchingPreset,
+  stillWatchingPresetFromEpisodeCount,
+} from "@/utils/stillWatching";
+import {
+  PLUGIN_APPLIED_DEFAULTS_KEY,
+  PLUGIN_SETTINGS_KEY,
+  readStoredSettings,
+  SETTINGS_KEY,
+} from "@/utils/storedSettings";
+import { storage } from "../mmkv";
+import {
+  type AppliedPluginDefaults,
+  dropSeededSecrets,
+  hasMeaningfulSettingValue,
+  pluginRefreshOverlay,
+  readIntegrationBlocks,
+  renameLegacySeerrSettings,
+  resolveEffectiveSettings,
+  SENSITIVE_SETTING_KEYS,
+} from "./settingsOverrides";
+
+const _STREAMYFIN_PLUGIN_ID = "1e9e5d386e6746158719e98a5c34f004";
+const STREAMYFIN_PLUGIN_SETTINGS = PLUGIN_SETTINGS_KEY;
+
+export type DownloadQuality = "original" | "high" | "low";
+
+export type DownloadOption = {
+  label: string;
+  value: DownloadQuality;
+};
+
+export const ScreenOrientationEnum: Record<
+  (typeof ScreenOrientation.OrientationLock)[keyof typeof ScreenOrientation.OrientationLock],
+  string
+> = {
+  [ScreenOrientation.OrientationLock.DEFAULT]:
+    "home.settings.other.orientations.DEFAULT",
+  [ScreenOrientation.OrientationLock.ALL]:
+    "home.settings.other.orientations.ALL",
+  [ScreenOrientation.OrientationLock.PORTRAIT]:
+    "home.settings.other.orientations.PORTRAIT",
+  [ScreenOrientation.OrientationLock.PORTRAIT_UP]:
+    "home.settings.other.orientations.PORTRAIT_UP",
+  [ScreenOrientation.OrientationLock.PORTRAIT_DOWN]:
+    "home.settings.other.orientations.PORTRAIT_DOWN",
+  [ScreenOrientation.OrientationLock.LANDSCAPE]:
+    "home.settings.other.orientations.LANDSCAPE",
+  [ScreenOrientation.OrientationLock.LANDSCAPE_LEFT]:
+    "home.settings.other.orientations.LANDSCAPE_LEFT",
+  [ScreenOrientation.OrientationLock.LANDSCAPE_RIGHT]:
+    "home.settings.other.orientations.LANDSCAPE_RIGHT",
+  [ScreenOrientation.OrientationLock.OTHER]:
+    "home.settings.other.orientations.OTHER",
+  [ScreenOrientation.OrientationLock.UNKNOWN]:
+    "home.settings.other.orientations.UNKNOWN",
+};
+
+export const DownloadOptions: DownloadOption[] = [
+  {
+    label: "Original quality",
+    value: "original",
+  },
+  {
+    label: "High quality",
+    value: "high",
+  },
+  {
+    label: "Small file size",
+    value: "low",
+  },
+];
+
+export type LibraryOptions = {
+  display: "row" | "list";
+  cardStyle: "compact" | "detailed";
+  imageStyle: "poster" | "cover";
+  showTitles: boolean;
+  showStats: boolean;
+};
+
+export type DefaultLanguageOption = {
+  value: string;
+  label: string;
+};
+
+export type Home = {
+  sections: Array<HomeSection>;
+};
+
+export type HomeSection = {
+  title?: string;
+  orientation?: "horizontal" | "vertical";
+  items?: HomeSectionItemResolver;
+  nextUp?: HomeSectionNextUpResolver;
+  latest?: HomeSectionLatestResolver;
+  custom?: HomeSectionCustomEndpointResolver;
+};
+
+export type HomeSectionItemResolver = {
+  title?: string;
+  sortBy?: Array<ItemSortBy>;
+  sortOrder?: Array<SortOrder>;
+  includeItemTypes?: Array<BaseItemKind>;
+  genres?: Array<string>;
+  parentId?: string;
+  limit?: number;
+  filters?: Array<ItemFilter>;
+};
+
+export type HomeSectionCustomEndpointResolver = {
+  title?: string;
+  endpoint: string;
+  headers?: any;
+  query?: any;
+};
+
+export type HomeSectionNextUpResolver = {
+  parentId?: string;
+  limit?: number;
+  enableResumable?: boolean;
+  enableRewatching?: boolean;
+};
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+/**
+ * The plugin may send object-typed settings as plain primitives.
+ * Resolve to the proper option object from the available choices.
+ */
+const normalizePluginValue = (
+  settingsKey: keyof Settings,
+  value: unknown,
+): unknown => {
+  if (settingsKey === "subtitleSize" && isFiniteNumber(value) && value >= 10) {
+    return value / 100;
+  }
+
+  // A preset this build does not know, or the old episode count sent under
+  // the new name, would otherwise turn the prompt off without a word. An
+  // empty value stays empty, so it is not mistaken for an admin's choice.
+  if (settingsKey === "stillWatchingPreset") {
+    return coerceStillWatchingPreset(value) ?? value;
+  }
+
+  if (typeof value !== "object" || value === null) {
+    const defaultVal = defaultValues[settingsKey];
+    if (
+      typeof defaultVal === "object" &&
+      defaultVal !== null &&
+      "key" in defaultVal &&
+      "value" in defaultVal
+    ) {
+      // defaultBitrate needs a lookup because its keys are human-readable
+      // (e.g. "8 Mb/s") that can't be derived from the raw value (e.g. 8000000).
+      // Anything else falls back to a key of String(value).
+      if (settingsKey === "defaultBitrate") {
+        // Jellyfin leaves a null out of the plugin's JSON, so a default
+        // without a value is the one the plugin ships: the app's own, Auto.
+        // The plugin names Max by its key, which the lookup below finds.
+        if (value === undefined || value === null) return AUTO_BITRATE;
+        const match = PLAYBACK_BITRATES.find(
+          (b) => b.key === value || b.value === value,
+        );
+        if (match) return match;
+      }
+      return { key: String(value), value };
+    }
+  }
+  return value;
+};
+
+export type HomeSectionLatestResolver = {
+  parentId?: string;
+  limit?: number;
+  groupItems?: boolean;
+  isPlayed?: boolean;
+  includeItemTypes?: Array<BaseItemKind>;
+};
+
+// Video player enum. MPV is the universal default; ExoPlayer is an
+// opt-in alternative on Android TV, selectable via settings.videoPlayer.
+// Native is the fully-native chrome (iOS/Android mobile, plus the TV
+// toggles) — it decodes with the selected engine, see
+// getActiveVideoPlayerEngine.
+export enum VideoPlayer {
+  MPV = 0,
+  ExoPlayer = 1,
+  Native = 2,
+}
+
+/**
+ * Whether ExoPlayer's native module is available on the current platform.
+ * ExoPlayer only ships for Android TV; on any other platform a persisted
+ * `videoPlayer: ExoPlayer` preference (e.g. MMKV roaming) must fall back
+ * to MPV rather than crash on requireNativeView().
+ */
+export const isExoPlayerSupported =
+  Platform.OS === "android" && Platform.isTV === true;
+
+/**
+ * Whether the fully-native player is available on the current platform.
+ * It ships for iPhone/iPad and Android mobile/tablet (not TV); on iOS it is
+ * the default, on Android it is currently opt-in via settings.
+ */
+export const isNativePlayerSupported =
+  (Platform.OS === "ios" || Platform.OS === "android") &&
+  Platform.isTV !== true;
+
+/**
+ * Whether the fully-native player can run on the current platform as the
+ * Apple TV variant. Like iPhone/iPad it is the default, with the
+ * `nativeVideoPlayerTV` setting as the opt-out, and it requires tvOS 26+ —
+ * the chrome is built on native glass Menus and other 26-era APIs, so older
+ * boxes keep the JS player unconditionally.
+ */
+export const isNativePlayerSupportedTV =
+  Platform.OS === "ios" &&
+  Platform.isTV === true &&
+  Number.parseInt(String(Platform.Version), 10) >= 26;
+
+/**
+ * Whether the fully-native player can run on the current platform as the
+ * Android TV variant. It is opt-in via `nativeVideoPlayerAndroidTV` (default false),
+ * and requires Android TV.
+ */
+export const isNativePlayerSupportedAndroidTV =
+  Platform.OS === "android" && Boolean(Platform.isTV);
+
+/**
+ * The DECODING ENGINE for the current settings — never `Native`. MPV is the
+ * universal default; ExoPlayer is an opt-in alternative on Android TV. The
+ * engine axis is independent of the controls axis: the fully-native chrome
+ * decodes with this same engine (see NativePlayerConfig.engine), so the
+ * device profile and the chrome's engine must both resolve from here.
+ */
+export const getActiveVideoPlayerEngine = (
+  settings:
+    | Partial<
+        Pick<
+          Settings,
+          "videoPlayer" | "nativeVideoPlayerTV" | "nativeVideoPlayerAndroidTV"
+        >
+      >
+    | null
+    | undefined,
+): VideoPlayer => {
+  if (isExoPlayerSupported && settings?.videoPlayer === VideoPlayer.ExoPlayer) {
+    return VideoPlayer.ExoPlayer;
+  }
+  return VideoPlayer.MPV;
+};
+
+/**
+ * Resolve what actually RENDERS for the current settings: the fully-native
+ * chrome when it is active, otherwise the JS-route engine view. The native
+ * toggles pick the CONTROLS layer only — the chrome decodes with
+ * getActiveVideoPlayerEngine, so this function says nothing about the
+ * engine (use getActivePlayerType for that).
+ *
+ * On iPhone/iPad the chrome is the default: an unset `videoPlayer` (user
+ * never chose) or an explicit `Native` selection resolves to Native, while
+ * an explicit MPV choice is the opt-out and wins. On Apple TV (tvOS 26+) the
+ * chrome is likewise the default with `nativeVideoPlayerTV` as the opt-out;
+ * on Android TV it is opt-in via `nativeVideoPlayerAndroidTV`. The platform
+ * capability gates are folded in here so a caller is never told one thing
+ * renders while another actually does — that mismatch would let Jellyfin
+ * pick a stream for the wrong renderer.
+ */
+export const getActiveVideoPlayer = (
+  settings:
+    | Partial<
+        Pick<
+          Settings,
+          "videoPlayer" | "nativeVideoPlayerTV" | "nativeVideoPlayerAndroidTV"
+        >
+      >
+    | null
+    | undefined,
+): VideoPlayer => {
+  if (isNativePlayerSupportedTV && settings?.nativeVideoPlayerTV !== false) {
+    return VideoPlayer.Native;
+  }
+  if (
+    isNativePlayerSupportedAndroidTV &&
+    settings?.nativeVideoPlayerAndroidTV === true
+  ) {
+    return VideoPlayer.Native;
+  }
+  if (
+    isNativePlayerSupported &&
+    ((Platform.OS === "ios" && settings?.videoPlayer === undefined) ||
+      settings?.videoPlayer === VideoPlayer.Native)
+  ) {
+    return VideoPlayer.Native;
+  }
+  return getActiveVideoPlayerEngine(settings);
+};
+
+/**
+ * Should a play request be handed to the fully-native chrome? The routing
+ * predicate for usePlayMedia and the WS "Play" handler — the engine choice
+ * travels along inside the presented config.
+ */
+export const isNativeChromeActive = (
+  settings:
+    | Partial<
+        Pick<
+          Settings,
+          "videoPlayer" | "nativeVideoPlayerTV" | "nativeVideoPlayerAndroidTV"
+        >
+      >
+    | null
+    | undefined,
+): boolean => getActiveVideoPlayer(settings) === VideoPlayer.Native;
+
+/**
+ * The lowercase player-type identifier that `generateDeviceProfile` expects.
+ * This is the ENGINE, always — even while the chrome presents. A chrome-on-
+ * ExoPlayer session must negotiate the ExoPlayer profile, and
+ * buildNativePlayerConfig passes the same value as the config's engine.
+ */
+export const getActivePlayerType = (
+  settings:
+    | Partial<
+        Pick<
+          Settings,
+          "videoPlayer" | "nativeVideoPlayerTV" | "nativeVideoPlayerAndroidTV"
+        >
+      >
+    | null
+    | undefined,
+): "mpv" | "exoplayer" => {
+  return getActiveVideoPlayerEngine(settings) === VideoPlayer.ExoPlayer
+    ? "exoplayer"
+    : "mpv";
+};
+
+// TV Typography scale presets
+export enum TVTypographyScale {
+  Small = "small",
+  Default = "default",
+  Large = "large",
+  ExtraLarge = "extraLarge",
+}
+
+// Segment skip behavior options
+export type SegmentSkipMode = "none" | "ask" | "auto";
+
+// Audio transcoding mode - controls how surround audio is handled
+// This controls server-side transcoding behavior for audio streams.
+// MPV decodes via FFmpeg and supports most formats, but mobile devices
+// can't passthrough to external receivers, so this primarily affects
+// bandwidth usage and server load.
+export enum AudioTranscodeMode {
+  Auto = "auto", // Platform defaults (recommended)
+  ForceStereo = "stereo", // Always transcode to stereo
+  Allow51 = "5.1", // Allow up to 5.1, transcode 7.1+
+  AllowAll = "passthrough", // Direct play all audio formats
+}
+
+// Inactivity timeout for TV - auto logout after period of no activity
+export enum InactivityTimeout {
+  Disabled = 0,
+  OneMinute = 60000,
+  FiveMinutes = 300000,
+  FifteenMinutes = 900000,
+  ThirtyMinutes = 1800000,
+  OneHour = 3600000,
+  FourHours = 14400000,
+  TwentyFourHours = 86400000,
+}
+
+// MPV cache mode - controls how caching is enabled
+export type MpvCacheMode = "auto" | "yes" | "no";
+export type MpvVoDriver = "gpu-next" | "gpu";
+
+/** Content groups that can appear in the home hero carousel. */
+export type HomeHeroSection = "continueWatching" | "nextUp" | "recentlyAdded";
+/** Media kinds that can appear in the home hero carousel. */
+export type HomeHeroMediaType = "movie" | "tv";
+
+export type Settings = {
+  home?: Home | null;
+  deviceProfile?: "Expo" | "Native" | "Old";
+  mediaListCollectionIds?: string[];
+  preferedLanguage?: string;
+  searchEngine: "Marlin" | "Jellyfin" | "Streamystats";
+  /** Video player backend. Defaults to MPV when unset (see getActiveVideoPlayer). */
+  videoPlayer?: VideoPlayer;
+  marlinServerUrl?: string;
+  streamyStatsServerUrl?: string;
+  streamyStatsMovieRecommendations?: boolean;
+  streamyStatsSeriesRecommendations?: boolean;
+  streamyStatsPromotedWatchlists?: boolean;
+  downloadQuality?: DownloadOption;
+  /** iOS only: show a Lock Screen / Dynamic Island Live Activity while a download runs. */
+  showDownloadLiveActivity: boolean;
+  defaultBitrate?: Bitrate;
+  /** Auto: the share of the measured speed a stream may take. */
+  autoBitrateRatio: number;
+  /** Auto: how long a measure is used before the next, in minutes. */
+  autoBitrateTtlMinutes: number;
+  /** Auto: the least a stream gets in the server's network, in bit/s; 0 for none. */
+  autoBitrateInNetworkMin: number;
+  /** Auto: steps down when a stream stalls, and back up once the link allows. */
+  autoBitrateAdapt: boolean;
+  libraryOptions: LibraryOptions;
+  defaultAudioLanguage: CultureDto | null;
+  playDefaultAudioTrack: boolean;
+  rememberAudioSelections: boolean;
+  defaultSubtitleLanguage: CultureDto | null;
+  subtitleMode: SubtitlePlaybackMode;
+  rememberSubtitleSelections: boolean;
+  /** Turn subtitles on automatically while audio is muted, and off again after. */
+  subtitlesOnMute: boolean;
+  /**
+   * Let that automatic selection pick a subtitle the server must re-process the
+   * stream for (burned-in, or image-based while transcoding). Off by default:
+   * a volume key press should never interrupt playback.
+   */
+  subtitlesOnMuteAllowRestart: boolean;
+  showHomeTitles: boolean;
+  defaultVideoOrientation: (typeof ScreenOrientation.OrientationLock)[keyof typeof ScreenOrientation.OrientationLock];
+  forwardSkipTime: number;
+  rewindSkipTime: number;
+  showCustomMenuLinks: boolean;
+  disableHapticFeedback: boolean;
+  subtitleSize: number;
+  subtitleBackground: boolean;
+  subtitleBackgroundOpacity: number;
+  subtitleBackgroundPadding: number;
+  subtitleFont: string;
+  subtitleColor: string;
+  subtitleMarginY?: number;
+  subtitleAlignX?: "left" | "center" | "right";
+  subtitleAlignY?: "top" | "center" | "bottom";
+  safeAreaInControlsEnabled: boolean;
+  seerrServerUrl?: string;
+  /** Seerr admin API key: signs the user in via their Jellyfin ID, no password. */
+  seerrApiKey?: string;
+  /**
+   * Sign in to Seerr automatically on launch using the Jellyfin password.
+   * Seerr's /auth/jellyfin endpoint takes the password rather than the
+   * Jellyfin token, so enabling this persists that password in the platform
+   * secure store. Nothing is stored unless a Seerr server is configured.
+   */
+  autoLoginSeerr: boolean;
+  useKefinTweaks: boolean;
+  hiddenLibraries?: string[];
+  /** "Still watching?" prompt, see constants/StillWatching.ts. */
+  stillWatchingPreset: StillWatchingPreset;
+  autoPlayNextEpisode: boolean;
+  /** TV only: ask "Stop playback?" when Back is pressed during playback. */
+  confirmBeforeStoppingPlayback: boolean;
+  /** SyncPlay: join groups without being waited for. Per device. */
+  syncPlayIgnoreWait: boolean;
+  // Media segment skip preferences
+  skipIntro: SegmentSkipMode;
+  skipOutro: SegmentSkipMode;
+  skipRecap: SegmentSkipMode;
+  skipCommercial: SegmentSkipMode;
+  skipPreview: SegmentSkipMode;
+  /** Ask whether to resume or start over when playing an in-progress item. */
+  showResumeDialog: boolean;
+  // Playback speed settings
+  defaultPlaybackSpeed: number;
+  playbackSpeedPerMedia: Record<string, number>;
+  playbackSpeedPerShow: Record<string, number>;
+  // MPV buffer/cache settings
+  mpvCacheEnabled?: MpvCacheMode;
+  mpvCacheSeconds?: number;
+  mpvDemuxerMaxBytes?: number; // MB
+  mpvDemuxerMaxBackBytes?: number; // MB
+  // MPV video output driver (Android only)
+  mpvVoDriver?: MpvVoDriver;
+  // Gesture controls
+  enableHorizontalSwipeSkip: boolean;
+  enableLeftSideBrightnessSwipe: boolean;
+  enableRightSideVolumeSwipe: boolean;
+  enableHoldToSpeed: boolean;
+  holdToSpeedRate: number;
+  enablePinchToZoom: boolean;
+  enableDoubleTapToSeek: boolean;
+  hideVolumeSlider: boolean;
+  hideBrightnessSlider: boolean;
+  usePopularPlugin: boolean;
+  mergeNextUpAndContinueWatching: boolean;
+  /** Home row of episodes about to air, from every TV library. Off by default. */
+  showUpcomingOnHome: boolean;
+  /**
+   * Home hero carousel filters. Both are "hidden" lists, so an empty list
+   * (the default) shows everything, and they combine: hiding the
+   * "recentlyAdded" group and the "movie" media type leaves only
+   * continue-watching and next-up episodes.
+   */
+  hiddenHomeHeroSections?: HomeHeroSection[];
+  hiddenHomeHeroMediaTypes?: HomeHeroMediaType[];
+  // Use the episode's own image (instead of the series thumb) for the
+  // "Next Up" and "Continue Watching" home rows.
+  useEpisodeImagesForNextUp: boolean;
+  // TV-specific settings
+  /** Apple TV only: use the fully-native tvOS player (default on; needs tvOS 26+). */
+  nativeVideoPlayerTV: boolean;
+  /** Android TV only: use the fully-native Android TV player (opt-in; default off). */
+  nativeVideoPlayerAndroidTV?: boolean;
+  /**
+   * Android TV only: switch the display to a refresh rate matching the
+   * video's frame rate (default off — the mode switch is non-seamless on
+   * most panels, a brief black flash on rate changes).
+   */
+  matchRefreshRate?: boolean;
+  showHomeBackdrop: boolean;
+  /**
+   * The home hero carousel, on every platform — the TV one and the iOS one
+   * are the same feature and share this single switch. Stored values from
+   * the old TV-only `showTVHeroCarousel` key are migrated in `loadSettings`.
+   */
+  showHeroCarousel: boolean;
+  tvTypographyScale: TVTypographyScale;
+  showSeriesPosterOnEpisode: boolean;
+  tvThemeMusicEnabled: boolean;
+  // Appearance
+  hideRemoteSessionButton: boolean;
+  hideWatchlistsTab: boolean;
+  // Audio look-ahead caching
+  audioLookaheadEnabled: boolean;
+  audioLookaheadCount: number;
+  audioMaxCacheSizeMB: number;
+  // Music playback
+  preferLocalAudio: boolean;
+  /** Evens out loudness between music tracks with the server's gains. */
+  musicNormalizationMode: MusicNormalizationMode;
+  // Audio transcoding mode
+  audioTranscodeMode: AudioTranscodeMode;
+  // Optional third-party lookups. Both call a service directly from the client
+  // rather than through Jellyfin, so each can be turned off on its own.
+  wikidataAwardsEnabled: boolean;
+  openSubtitlesEnabled: boolean;
+  // OpenSubtitles API key for client-side subtitle fetching
+  openSubtitlesApiKey?: string;
+  // TV-only: Inactivity timeout for auto-logout
+  inactivityTimeout: InactivityTimeout;
+  /** Anonymous crash/error reporting via Sentry (on by default, opt-out). */
+  sentryEnabled: boolean;
+};
+
+export interface Lockable<T> {
+  locked: boolean;
+  value: T;
+}
+
+export type PluginLockableSettings = {
+  [K in keyof Settings]: Lockable<Settings[K]>;
+};
+
+// Read first: the plugin sends the Seerr key under its old flat name and
+// inside the seerr block, and only the app's own name is on the list above.
+export const redactPluginSettings = (
+  sent: PluginLockableSettings | undefined,
+): PluginLockableSettings | undefined => {
+  const settings = readIntegrationBlocks(sent);
+  return (
+    settings &&
+    (Object.fromEntries(
+      Object.entries(settings).map(([key, lockable]) => [
+        key,
+        SENSITIVE_SETTING_KEYS.has(key as keyof Settings) && lockable?.value
+          ? { ...lockable, value: REDACTED_PLACEHOLDER }
+          : lockable,
+      ]),
+    ) as PluginLockableSettings)
+  );
+};
+
+// What the previous account signs in with, dropped as soon as another account
+// signs in: the secrets, and the Seerr address, where a Seerr sign-in starting
+// for the next account would send that account's password. No tab depends on
+// the address, unlike the locks that stay until the next account's arrive.
+const SIGN_IN_SETTING_KEYS: ReadonlySet<keyof Settings> = new Set([
+  ...SENSITIVE_SETTING_KEYS,
+  "seerrServerUrl",
+]);
+
+// Read first, as above, so nothing stays behind under an old name.
+const withoutSignIns = (
+  sent: PluginLockableSettings | undefined,
+): PluginLockableSettings | undefined => {
+  const settings = readIntegrationBlocks(sent);
+  return (
+    settings &&
+    (Object.fromEntries(
+      Object.entries(settings).filter(
+        ([key]) => !SIGN_IN_SETTING_KEYS.has(key as keyof Settings),
+      ),
+    ) as PluginLockableSettings)
+  );
+};
+
+export const defaultValues: Settings = {
+  home: null,
+  deviceProfile: "Expo",
+  mediaListCollectionIds: [],
+  preferedLanguage: undefined,
+  searchEngine: "Jellyfin",
+  // videoPlayer intentionally undefined — resolved at runtime via
+  // getActiveVideoPlayer() so existing installs are unaffected.
+  marlinServerUrl: "",
+  streamyStatsServerUrl: "",
+  streamyStatsMovieRecommendations: false,
+  streamyStatsSeriesRecommendations: false,
+  streamyStatsPromotedWatchlists: false,
+  downloadQuality: DownloadOptions[0],
+  showDownloadLiveActivity: true,
+  defaultBitrate: AUTO_BITRATE,
+  autoBitrateRatio: DETECTED_BITRATE_RATIO,
+  autoBitrateTtlMinutes: BITRATE_DETECTION_TTL_MS / 60_000,
+  autoBitrateInNetworkMin: IN_NETWORK_MIN_BITRATE,
+  autoBitrateAdapt: true,
+  libraryOptions: {
+    display: "list",
+    cardStyle: "detailed",
+    imageStyle: "cover",
+    showTitles: true,
+    showStats: true,
+  },
+  defaultAudioLanguage: null,
+  playDefaultAudioTrack: true,
+  rememberAudioSelections: true,
+  defaultSubtitleLanguage: null,
+  subtitleMode: SubtitlePlaybackMode.Default,
+  rememberSubtitleSelections: true,
+  subtitlesOnMute: true,
+  subtitlesOnMuteAllowRestart: false,
+  showHomeTitles: true,
+  defaultVideoOrientation: ScreenOrientation.OrientationLock.DEFAULT,
+  forwardSkipTime: 30,
+  rewindSkipTime: 10,
+  showCustomMenuLinks: false,
+  disableHapticFeedback: false,
+  subtitleSize: 1.0,
+  subtitleBackground: false,
+  subtitleBackgroundOpacity: 60,
+  subtitleBackgroundPadding: 8,
+  subtitleFont: "System",
+  subtitleColor: "#FFFFFF",
+  subtitleMarginY: 25,
+  subtitleAlignX: "center",
+  subtitleAlignY: "bottom",
+  safeAreaInControlsEnabled: true,
+  seerrServerUrl: undefined,
+  seerrApiKey: undefined,
+  autoLoginSeerr: true,
+  useKefinTweaks: false,
+  hiddenLibraries: [],
+  stillWatchingPreset: DEFAULT_STILL_WATCHING_PRESET,
+  autoPlayNextEpisode: true,
+  confirmBeforeStoppingPlayback: false,
+  syncPlayIgnoreWait: false,
+  // Media segment skip defaults
+  skipIntro: "ask",
+  skipOutro: "ask",
+  skipRecap: "ask",
+  skipCommercial: "ask",
+  skipPreview: "ask",
+  showResumeDialog: false,
+  // Playback speed defaults
+  defaultPlaybackSpeed: 1.0,
+  playbackSpeedPerMedia: {},
+  playbackSpeedPerShow: {},
+  // MPV buffer/cache defaults.
+  // Android TV gets tighter caps — combined with libmpv 1.0's larger
+  // baseline (fontconfig + libxml2 + libplacebo HDR path + scudo
+  // retention) the larger mobile budget pushes 2 GB Android TV boxes
+  // into swap death during 4K HDR playback. Apple TV has more RAM and
+  // keeps the full budget. Users can override via the settings screen.
+  mpvCacheEnabled: "auto",
+  mpvCacheSeconds: 10,
+  mpvDemuxerMaxBytes: Platform.isTV && Platform.OS === "android" ? 75 : 150, // MB
+  mpvDemuxerMaxBackBytes: Platform.isTV && Platform.OS === "android" ? 30 : 50, // MB
+  // MPV video output driver defaults (Android only)
+  mpvVoDriver: "gpu-next",
+  // Gesture controls
+  enableHorizontalSwipeSkip: true,
+  enableLeftSideBrightnessSwipe: true,
+  enableRightSideVolumeSwipe: true,
+  enableHoldToSpeed: true,
+  holdToSpeedRate: 2.0,
+  enablePinchToZoom: true,
+  enableDoubleTapToSeek: false,
+  hideVolumeSlider: false,
+  hideBrightnessSlider: false,
+  usePopularPlugin: true,
+  mergeNextUpAndContinueWatching: false,
+  showUpcomingOnHome: false,
+  hiddenHomeHeroSections: [],
+  hiddenHomeHeroMediaTypes: [],
+  useEpisodeImagesForNextUp: false,
+  // TV-specific settings
+  nativeVideoPlayerTV: true,
+  nativeVideoPlayerAndroidTV: false,
+  matchRefreshRate: false,
+  showHomeBackdrop: true,
+  showHeroCarousel: true,
+  tvTypographyScale: TVTypographyScale.Default,
+  showSeriesPosterOnEpisode: false,
+  tvThemeMusicEnabled: true,
+  // Appearance
+  hideRemoteSessionButton: false,
+  hideWatchlistsTab: false,
+  // Audio look-ahead caching defaults
+  audioLookaheadEnabled: true,
+  audioLookaheadCount: 1,
+  audioMaxCacheSizeMB: 500,
+  // Music playback
+  preferLocalAudio: true,
+  musicNormalizationMode: DEFAULT_MUSIC_NORMALIZATION_MODE,
+  // Audio transcoding mode
+  audioTranscodeMode: AudioTranscodeMode.Auto,
+  // Optional third-party lookups
+  wikidataAwardsEnabled: true,
+  openSubtitlesEnabled: true,
+  // TV-only: Inactivity timeout (disabled by default)
+  inactivityTimeout: InactivityTimeout.Disabled,
+  // Crash reporting defaults on; the intro sheet and settings expose the opt-out
+  sentryEnabled: true,
+};
+
+type LegacySubtitleSettings = Partial<Settings> & {
+  mpvSubtitleScale?: number;
+  mpvSubtitleMarginY?: number;
+  mpvSubtitleAlignX?: "left" | "center" | "right";
+  mpvSubtitleAlignY?: "top" | "center" | "bottom";
+  mpvSubtitleFontSize?: number;
+  mpvSubtitleBackgroundEnabled?: boolean;
+  mpvSubtitleBackgroundOpacity?: number;
+};
+
+const migrateSubtitleSettings = (settings: LegacySubtitleSettings) => {
+  let changed = false;
+
+  if (isFiniteNumber(settings.mpvSubtitleScale)) {
+    settings.subtitleSize = settings.mpvSubtitleScale;
+    changed = true;
+  } else if (
+    isFiniteNumber(settings.subtitleSize) &&
+    settings.subtitleSize >= 10
+  ) {
+    settings.subtitleSize = settings.subtitleSize / 100;
+    changed = true;
+  }
+
+  if (isFiniteNumber(settings.mpvSubtitleMarginY)) {
+    settings.subtitleMarginY = settings.mpvSubtitleMarginY;
+    changed = true;
+  }
+
+  if (settings.mpvSubtitleAlignX) {
+    settings.subtitleAlignX = settings.mpvSubtitleAlignX;
+    changed = true;
+  }
+
+  if (settings.mpvSubtitleAlignY) {
+    settings.subtitleAlignY = settings.mpvSubtitleAlignY;
+    changed = true;
+  }
+
+  // The legacy MPV background setting lived in a separate advanced section.
+  // Treat an explicit true as user intent, but do not let the old default false
+  // overwrite the primary subtitleBackground setting.
+  if (settings.mpvSubtitleBackgroundEnabled === true) {
+    settings.subtitleBackground = true;
+    changed = true;
+
+    if (isFiniteNumber(settings.mpvSubtitleBackgroundOpacity)) {
+      settings.subtitleBackgroundOpacity =
+        settings.mpvSubtitleBackgroundOpacity;
+    }
+  } else if (
+    settings.subtitleBackgroundOpacity === undefined &&
+    isFiniteNumber(settings.mpvSubtitleBackgroundOpacity)
+  ) {
+    settings.subtitleBackgroundOpacity = settings.mpvSubtitleBackgroundOpacity;
+    changed = true;
+  }
+
+  const legacyKeys: Array<keyof LegacySubtitleSettings> = [
+    "mpvSubtitleScale",
+    "mpvSubtitleMarginY",
+    "mpvSubtitleAlignX",
+    "mpvSubtitleAlignY",
+    "mpvSubtitleFontSize",
+    "mpvSubtitleBackgroundEnabled",
+    "mpvSubtitleBackgroundOpacity",
+  ];
+
+  for (const key of legacyKeys) {
+    if (key in settings) {
+      delete settings[key];
+      changed = true;
+    }
+  }
+
+  return changed;
+};
+
+/**
+ * Carries the old `maxAutoPlayEpisodeCount` cap over to `stillWatchingPreset`
+ * and drops the old key. Also used on the plugin's answer, whose value is
+ * wrapped in `{ locked, value }`, and on the applied-defaults record.
+ * `fallback` names the preset for a value it cannot read; without one, such
+ * a value is dropped.
+ */
+export const migrateStillWatchingSetting = (
+  settings: Record<string, unknown>,
+  unwrap: (value: unknown) => unknown = (value) => value,
+  wrap: (preset: StillWatchingPreset, legacy: unknown) => unknown = (preset) =>
+    preset,
+  fallback: (legacy: unknown) => StillWatchingPreset | undefined = () =>
+    undefined,
+  isLocked: (value: unknown) => boolean = () => false,
+): boolean => {
+  if (!("maxAutoPlayEpisodeCount" in settings)) return false;
+  const legacy = settings.maxAutoPlayEpisodeCount;
+  delete settings.maxAutoPlayEpisodeCount;
+  const preset =
+    stillWatchingPresetFromEpisodeCount(unwrap(legacy)) ?? fallback(legacy);
+  // The new name wins unless it is empty, or the old one is the admin's lock.
+  const current = settings.stillWatchingPreset;
+  const replace =
+    (!hasMeaningfulSettingValue(unwrap(current)) &&
+      !(isLocked(current) && !isLocked(legacy))) ||
+    (isLocked(legacy) && !isLocked(current));
+  if (preset && replace) {
+    settings.stillWatchingPreset = wrap(preset, legacy);
+  }
+  return true;
+};
+
+const loadSettings = (): Partial<Settings> => {
+  const stored = readStoredSettings() as LegacySubtitleSettings & {
+    showTVHeroCarousel?: boolean;
+    maxAutoPlayEpisodeCount?: unknown;
+  };
+  let changed = migrateSubtitleSettings(stored);
+
+  // `showTVHeroCarousel` became `showHeroCarousel` once the hero shipped on
+  // phones too and the two were merged into one switch. Carry a stored TV
+  // preference across so a hero someone had turned off stays off.
+  if (
+    stored.showHeroCarousel === undefined &&
+    stored.showTVHeroCarousel !== undefined
+  ) {
+    stored.showHeroCarousel = stored.showTVHeroCarousel;
+    changed = true;
+  }
+  if ("showTVHeroCarousel" in stored) {
+    delete stored.showTVHeroCarousel;
+    changed = true;
+  }
+
+  // The episode cap became jellyfin-web 12's "Still watching?" presets, and
+  // the count it was checked against now lives with the in-memory session.
+  if (migrateStillWatchingSetting(stored as Record<string, unknown>)) {
+    changed = true;
+  }
+  if ("autoPlayEpisodeCount" in stored) {
+    delete (stored as Record<string, unknown>).autoPlayEpisodeCount;
+    changed = true;
+  }
+
+  // Seerr's settings were stored under the names they had as Jellyseerr.
+  if (renameLegacySeerrSettings(stored as Record<string, unknown>)) {
+    changed = true;
+  }
+
+  // An earlier build seeded the plugin's secrets here, where they stayed for
+  // every account signed in after the one they were served to. The record of
+  // what was seeded is read under the same names as the settings.
+  const applied = { ...loadAppliedPluginDefaults() } as Record<string, unknown>;
+  renameLegacySeerrSettings(applied);
+  if (dropSeededSecrets(stored as Record<string, unknown>, applied)) {
+    storage.setAny(PLUGIN_APPLIED_DEFAULTS_KEY, applied);
+    changed = true;
+  }
+
+  if (changed) {
+    storage.set(SETTINGS_KEY, JSON.stringify(stored));
+  }
+  return stored;
+};
+
+const EXCLUDE_FROM_SAVE = ["home"];
+
+const saveSettings = (settings: Settings) => {
+  try {
+    const persistedSettings = { ...settings };
+    for (const key of Object.keys(persistedSettings)) {
+      if (EXCLUDE_FROM_SAVE.includes(key)) {
+        delete persistedSettings[key as keyof Settings];
+      }
+    }
+    const jsonValue = JSON.stringify(persistedSettings);
+    storage.set(SETTINGS_KEY, jsonValue);
+  } catch (error) {
+    // The user's change is silently lost when this fails.
+    logAndCaptureError("Saving settings failed", error);
+  }
+};
+
+export const settingsAtom = atom<Partial<Settings> | null>(null);
+
+/**
+ * Server-side counterpart to the `showTVHeroCarousel` migration in
+ * `loadSettings`: the Streamyfin plugin config still keys the hero switch
+ * under the old name, so alias it or an admin's existing lock and default
+ * would quietly stop being enforced after the rename. Seerr's settings are
+ * read the same way, from the block or the old flat keys, which covers the
+ * copy an earlier build stored as well as a fresh answer.
+ */
+const migratePluginSettings = (
+  sent: PluginLockableSettings | undefined,
+): PluginLockableSettings | undefined => {
+  const settings = readIntegrationBlocks(sent);
+  if (!settings) {
+    return settings;
+  }
+  const migrated = { ...settings } as Record<string, unknown>;
+  // An admin's lock on the old episode cap keeps locking the preset, even
+  // when its value can't be read.
+  migrateStillWatchingSetting(
+    migrated,
+    (lockable) => (lockable as Lockable<unknown> | undefined)?.value,
+    (preset, lockable) => ({
+      ...(lockable as Lockable<unknown>),
+      value: preset,
+    }),
+    (lockable) =>
+      (lockable as Lockable<unknown> | undefined)?.locked
+        ? DEFAULT_STILL_WATCHING_PRESET
+        : undefined,
+    (lockable) => (lockable as Lockable<unknown> | undefined)?.locked === true,
+  );
+  // An empty preset is no choice: locked, it keeps the prompt on at the app
+  // default rather than pinning it off; unlocked, it supplies nothing.
+  const preset = migrated.stillWatchingPreset as Lockable<unknown> | undefined;
+  if (preset && !hasMeaningfulSettingValue(preset.value)) {
+    if (preset.locked) {
+      migrated.stillWatchingPreset = {
+        ...preset,
+        value: DEFAULT_STILL_WATCHING_PRESET,
+      };
+    } else {
+      delete migrated.stillWatchingPreset;
+    }
+  }
+  const legacy = migrated.showTVHeroCarousel;
+  if (migrated.showHeroCarousel === undefined && legacy !== undefined) {
+    migrated.showHeroCarousel = legacy;
+  }
+  return migrated as PluginLockableSettings;
+};
+
+const loadPluginSettings = () => {
+  try {
+    return migratePluginSettings(
+      storage.get<PluginLockableSettings>(STREAMYFIN_PLUGIN_SETTINGS),
+    );
+  } catch (error) {
+    // Without the plugin settings the server admin's policy is not applied.
+    logAndCaptureError("Loading plugin settings failed", error);
+    return undefined;
+  }
+};
+
+export const pluginSettingsAtom = atom<PluginLockableSettings | undefined>(
+  loadPluginSettings(),
+);
+
+/**
+ * User settings with the admin's plugin overrides applied — the same value
+ * `useSettings().settings` returns, as an atom.
+ *
+ * Components that need a single setting should subscribe to this (or a
+ * `selectAtom` of it) instead of calling `useSettings`, which also pulls in the
+ * mutation helpers and a load effect.
+ */
+export const effectiveSettingsAtom = atom<Settings>((get) =>
+  resolveEffectiveSettings(
+    get(settingsAtom),
+    get(pluginSettingsAtom),
+    defaultValues,
+    normalizePluginValue,
+  ),
+);
+
+/**
+ * The plugin's settings under the app's names, logged with their secrets
+ * redacted. Undefined when the server has said there is nothing to apply,
+ * which readPluginSettings (utils/pluginSettingsSource) decides.
+ *
+ * Every other failure rejects: a request that never arrived, or a server that
+ * answered with an error of its own, says nothing about the plugin, and the
+ * caller must not read it as "no plugin".
+ */
+export const fetchPluginSettings = (api: {
+  getStreamyfinPluginSettings: () => Promise<
+    PluginLockableSettings | undefined
+  >;
+}): Promise<PluginLockableSettings | undefined> =>
+  api.getStreamyfinPluginSettings().then((settings) => {
+    if (settings) {
+      writeInfoLog("Got plugin settings", redactPluginSettings(settings));
+    }
+    return migratePluginSettings(settings);
+  });
+
+const loadAppliedPluginDefaults = (): AppliedPluginDefaults => {
+  try {
+    const applied =
+      storage.get<AppliedPluginDefaults>(PLUGIN_APPLIED_DEFAULTS_KEY) ?? {};
+    // Under the old name, a default applied then would be applied again over
+    // whatever the user has chosen since.
+    migrateStillWatchingSetting(applied as Record<string, unknown>);
+    return applied;
+  } catch {
+    return {};
+  }
+};
+
+export const useSettings = () => {
+  const jotaiStore = useStore();
+  const [_settings, setSettings] = useAtom(settingsAtom);
+  const [pluginSettings, _setPluginSettings] = useAtom(pluginSettingsAtom);
+
+  useEffect(() => {
+    if (_settings === null) {
+      const loadedSettings = loadSettings();
+      setSettings(loadedSettings);
+    }
+  }, [_settings, setSettings]);
+
+  const setPluginSettings = useCallback(
+    (settings: PluginLockableSettings | undefined) => {
+      const migrated = migratePluginSettings(settings);
+      storage.setAny(STREAMYFIN_PLUGIN_SETTINGS, migrated);
+      _setPluginSettings(migrated);
+    },
+    [_setPluginSettings],
+  );
+
+  // At an account switch, before the next account's refresh: the Seerr
+  // sign-ins would otherwise run for the next account with the previous one's
+  // key or toward its Seerr. The locks stay until that refresh replaces them.
+  const forgetPluginSignIns = useCallback(() => {
+    setPluginSettings(withoutSignIns(jotaiStore.get(pluginSettingsAtom)));
+  }, [jotaiStore, setPluginSettings]);
+
+  const refreshStreamyfinPluginSettings = useCallback(
+    async ({ atSignIn = false }: { atSignIn?: boolean } = {}) => {
+      // Read when called, not when rendered: a sign-in sets the new api and
+      // refreshes straight away, before a render hands this callback the new
+      // one.
+      const api = jotaiStore.get(apiAtom);
+      if (!api) {
+        return;
+      }
+      // The answer belongs to the session that asked. A sign-out or an account
+      // switch while it was on its way has moved on, and writing it now would
+      // hand the previous user's settings, credentials included, to the next.
+      // Compared by session rather than by object: the same session's api is
+      // rebuilt at launch, once the stored session is read back, and when the
+      // network changes the server's address, and its answer is still its own.
+      const stillCurrent = () => {
+        const current = jotaiStore.get(apiAtom);
+        return !!current && current.accessToken === api.accessToken;
+      };
+      let newPluginSettings: PluginLockableSettings | undefined;
+      try {
+        newPluginSettings = await fetchPluginSettings(api);
+      } catch (error) {
+        // No answer about the plugin, so what is stored stands. This runs on
+        // every return to the foreground, where a request fails for no better
+        // reason than the network not being back yet, and clearing here
+        // dropped the admin's locks and the tabs the plugin turns on until a
+        // later refresh got through.
+        //
+        // An HTTP failure is the server's or the network's and is left quiet,
+        // and so is an answer that is not the plugin's, which the transport
+        // marks expected: something in front of the server sent it. Anything
+        // else broke while reading an answer that did arrive, and would
+        // otherwise fail the same way on every refresh without a trace.
+        if (!isAxiosError(error) && !isExpectedError(error)) {
+          logAndCaptureError("Refreshing plugin settings failed", error);
+        }
+        // Except at a sign-in: what is stored is then the previous account's,
+        // kept only until this answer.
+        if (atSignIn && stillCurrent()) {
+          setPluginSettings(undefined);
+        }
+        return undefined;
+      }
+      if (!stillCurrent()) {
+        return undefined;
+      }
+      setPluginSettings(newPluginSettings);
+
+      // Write against the atom's value at apply time, not the hook's render
+      // snapshot: this runs while the user can be changing settings (the intro
+      // sheet is up during first-run login), and a merge built from the
+      // snapshot resurrected whatever the user had just overwritten.
+      if (newPluginSettings) {
+        setSettings((currentSettings) => {
+          if (!currentSettings) return currentSettings;
+
+          const applied = loadAppliedPluginDefaults();
+          const result = pluginRefreshOverlay(
+            newPluginSettings,
+            applied,
+            normalizePluginValue,
+          );
+          if (!result) return currentSettings;
+
+          const newSettings = {
+            ...defaultValues,
+            ...currentSettings,
+            ...result.overlay,
+          } as Settings;
+          saveSettings(newSettings);
+          storage.setAny(PLUGIN_APPLIED_DEFAULTS_KEY, result.applied);
+          return newSettings;
+        });
+      }
+
+      return newPluginSettings;
+    },
+    [jotaiStore, setPluginSettings, setSettings],
+  );
+
+  const updateSettings = (update: Partial<Settings>) => {
+    // Admin-locked settings are enforced at write time too: a control that
+    // isn't disabled in the UI must not persist a value the admin pinned.
+    // The read memo already overrides locked keys, but without this guard the
+    // write would silently land in user storage and resurface once unlocked.
+    const sanitizedUpdate = Object.fromEntries(
+      Object.entries(update).filter(
+        ([key]) => pluginSettings?.[key as keyof Settings]?.locked !== true,
+      ),
+    ) as Partial<Settings>;
+
+    if (Object.keys(sanitizedUpdate).length === 0) return;
+
+    setSettings((currentSettings) => {
+      if (!currentSettings) return currentSettings;
+
+      const requestedKeys = Object.keys(sanitizedUpdate) as Array<
+        keyof Settings
+      >;
+      const changedKeys = requestedKeys.filter(
+        (key) => !Object.is(currentSettings[key], sanitizedUpdate[key]),
+      );
+      if (changedKeys.length === 0) return currentSettings;
+
+      const newSettings = {
+        ...defaultValues,
+        ...currentSettings,
+        ...sanitizedUpdate,
+      } as Settings;
+      saveSettings(newSettings);
+      return newSettings;
+    });
+  };
+
+  const settings = useAtomValue(effectiveSettingsAtom);
+
+  return {
+    settings,
+    updateSettings,
+    pluginSettings,
+    setPluginSettings,
+    forgetPluginSignIns,
+    refreshStreamyfinPluginSettings,
+  };
+};

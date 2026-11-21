@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+root=$(dirname "$(readlink -f "$0")")
+ini=powervr.ini
+if [ "${1:-}" = --fbdev ]; then
+    ini=powervr-fbdev.ini
+    shift
+    test -r "$root/$ini" && test -r "$root/lib/libpvrWSEGL_fbdev.so"
+fi
+export XGB35_PVR_INI="$root/$ini"
+test "$#" -gt 0 || { echo "usage: sgx-run [--fbdev] PROGRAM [ARGS...]" >&2; exit 2; }
+if [ "$1" = --init ] || [ "$1" = --stop ]; then
+    test "$(uname -r)" = 3.10.52
+    mod=pvrsrvkm_sgx540_130
+    state=/run/xgb35-sgx540
+    mkdir -p "$state"
+    exec 9>"$state/lock"
+    flock -x 9
+    instance() { stat -c '%i' "/sys/module/$mod"; }
+    if [ "$1" = --stop ]; then
+        [ -d "/sys/module/$mod" ] || exit 0
+        [ "$(cat "$state/ready" 2>/dev/null || :)" = "$root $(instance)" ] ||
+            { echo "sgx-run: module belongs to another installation" >&2; exit 1; }
+        rmmod "$mod" || [ ! -d "/sys/module/$mod" ]
+        rm -f "$state/ready"
+        exit 0
+    fi
+    if [ -c /dev/pvrsrvkm ] && [ -d "/sys/module/$mod" ] &&
+       [ "$(cat "$state/ready" 2>/dev/null || :)" = "$root $(instance)" ]; then exit 0; fi
+    if [ -e /dev/pvrsrvkm ] || [ -d "/sys/module/$mod" ]; then
+        echo "sgx-run: an existing PowerVR driver owns the device" >&2
+        exit 1
+    fi
+    cd "$root"
+    insmod "./$mod.ko"
+    if [ -c /dev/pvrsrvkm ] && LD_LIBRARY_PATH="$root/lib" ./pvrsrvctl --start --no-module; then
+        echo "$root $(instance)" > "$state/ready"
+        exit 0
+    fi
+    rmmod "$mod" || :
+    exit 1
+fi
+"$root/sgx-run" --init
+export LD_LIBRARY_PATH="$root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XGB35_SGX=1
+exec "$@"

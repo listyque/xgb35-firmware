@@ -1,0 +1,9 @@
+{
+  "stage0_sector_sha256": "259144e32abc8923d012320969f27befac3c8a4f1457b8108e9dd556f937c9e5",
+  "row0_physical_sha256": "7686ddd9509e5ca28e99cff79b7374a649c7358e2b7059511c2c89577d35d0fd",
+  "block0_image_sha256": "df7ce18902de6461516bde333a462727b0d6cc8510075c3dd982c64c3806f6c1",
+  "programmed_rows": [
+    0
+  ],
+  "preserved_backup_block": 1
+}

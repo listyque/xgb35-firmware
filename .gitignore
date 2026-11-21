@@ -1,1 +1,13 @@
 /firmware/stock/2023-08-22/update.zip
+__pycache__/
+*.pyc
+/build/
+/ports/*/build/
+/ports/*/dist/
+/ports/*/game/
+/recovery/adfu/adfu-nand-pages-*-raw-with-oob.bin
+/recovery/adfu/adfu-nand-block-heads-*-raw-with-oob.bin
+/recovery/adfu/adfu-nand-first-32MiB-raw-with-oob.bin
+/recovery/adfu/nand-write-preparation/block0-*.jsonl
+/recovery/adfu/nand-write-preparation/block0-inspect-*.bin
+/recovery/adfu/nand-write-preparation/block0-before-*.bin

@@ -1,0 +1,974 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+#include "app/startup.h"
+#include "app/options.h"
+#include "app/positions.h"
+#include "app/render.h"
+#include "app/screen_events.h"
+#include "localization/language.h"
+#include "platform/audio.h"
+#include "platform/launch.h"
+#include "platform/menu_button.h"
+#include "platform/system_config.h"
+#include "platform/timing.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#ifdef MAINUI_ONION
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+#ifdef MAINUI_XGB35
+#include "platform/xgb35_hw.h"
+#endif
+
+#ifndef MAINUI_VERSION
+#define MAINUI_VERSION "0-dev"
+#endif
+
+/* Temporary startup diagnostics. Use 64-bit milliseconds on the 32-bit device. */
+static long long startup_ms(void)
+{
+    struct timespec t = {0};
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+#ifdef MAINUI_ONION
+/* RetroArch pans the framebuffer for double/triple buffering and resets the
+ * pan on a normal exit. An App that exits through pressMenu2Kill SIGKILLs it,
+ * leaving the pan non-zero. Our single-buffered SDL surface is drawn at offset
+ * 0, so every frame would be invisible. Best effort: never fails startup. */
+void mainui_reset_framebuffer_pan(const char *when)
+{
+    int fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "Cannot open /dev/fb0 to check pan (%s): %s\n", when, strerror(errno));
+        return;
+    }
+    struct fb_var_screeninfo var;
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &var) < 0) {
+        fprintf(stderr, "Cannot read framebuffer pan (%s): %s\n", when, strerror(errno));
+    }
+    else if (var.xoffset != 0 || var.yoffset != 0) {
+        unsigned x = var.xoffset, y = var.yoffset;
+        var.xoffset = 0;
+        var.yoffset = 0;
+        if (ioctl(fd, FBIOPAN_DISPLAY, &var) < 0 && ioctl(fd, FBIOPUT_VSCREENINFO, &var) < 0) {
+            fprintf(stderr, "Cannot reset framebuffer pan from %u,%u (%s): %s\n", x, y, when,
+                    strerror(errno));
+        }
+        else {
+            fprintf(stderr, "Reset framebuffer pan from %u,%u to 0,0 (%s)\n", x, y, when);
+        }
+    }
+    close(fd);
+}
+#endif
+
+/* Miyoo's SDL saves the framebuffer settings when video starts and writes them
+ * back in SDL_Quit (FB_VideoQuit: FBIOPUT_VSCREENINFO with saved_vinfo). After
+ * a killed RetroArch that restores its non-zero pan, and the next program's
+ * single-buffered SDL draws off screen. Stock MainUI never calls SDL_Quit on a
+ * normal exit. Keep the clean shutdown and reset the pan afterwards instead.
+ * The reset before SDL_Init normally makes the saved pan 0 already. */
+static void quit_sdl(const MainUIApp *ui)
+{
+#ifdef MAINUI_ONION
+    bool device = ui->real_device && !ui->snapshot;
+#else
+    (void)ui;
+#endif
+    SDL_Quit();
+#ifdef MAINUI_XGB35
+    xgb35_hw_quit();
+#endif
+#ifdef MAINUI_ONION
+    if (device) {
+        mainui_reset_framebuffer_pan("exit");
+    }
+#endif
+}
+
+int mainui_setup_session(MainUIApp *ui, int argc, char **argv)
+{
+    MainUIOptions options;
+    int parsed = mainui_options_parse(&options, argc, argv);
+    if (parsed >= 0) {
+        ui->informational = options.informational;
+        return parsed;
+    }
+    ui->dir = options.dir;
+    ui->base = options.base;
+    ui->config_dir = options.config_dir;
+    ui->list_path = options.list_path;
+    ui->snapshot = options.snapshot;
+    ui->handoff_dir = options.handoff_dir;
+    ui->device_directory = options.device_directory;
+    ui->sd = options.sd;
+    ui->system_name = options.system_name;
+    ui->input_script = options.input_script;
+    ui->input_text = options.input_text;
+    ui->real_device = options.real_device;
+    ui->battery_override = options.battery_override;
+    ui->battery_charging = options.battery_charging;
+    ui->start_systems = options.start_systems;
+    ui->refresh_caches = options.refresh_caches;
+    ui->snapshot_elapsed = options.snapshot_elapsed;
+    ui->battery_percent = options.battery_percent;
+    ui->device_adapter = (MainUIDeviceAdapter){0};
+    ui->device_status = (MainUIDeviceStatus){.battery = -1, .sleeping = -1, .wifi = -1, .lid = -1};
+    ui->next_device_check = 0;
+    ui->device_enabled = false;
+#ifdef MAINUI_ONION
+    ui->handheld_input = true;
+#else
+    ui->handheld_input = false;
+#endif
+    if (ui->real_device || ui->device_directory) {
+        if ((ui->real_device && ui->device_directory) || !ui->sd ||
+            !mainui_device_adapter_open(&ui->device_adapter,
+                                        ui->real_device ? DEVICE_ONION : DEVICE_SIMULATED,
+                                        ui->real_device ? "/tmp" : ui->device_directory) ||
+            (ui->real_device && !mainui_device_signals_install())) {
+            fprintf(stderr, "Device adapter unavailable or conflicting options\n");
+            return 2;
+        }
+        ui->device_enabled = true;
+        if (!ui->handoff_dir) {
+            ui->handoff_dir = ui->device_adapter.runtime;
+        }
+        ui->device_status = mainui_device_status(&ui->device_adapter);
+        if (!ui->battery_override) {
+            ui->battery_percent = ui->device_status.battery;
+        }
+    }
+    if (ui->sd) {
+        /* Patcher startup contract: restore hidden Recent data before readers,
+         * regardless of whether the Recent menu is visible. */
+        if (!mainui_library_restore_recent(ui->sd)) {
+            fprintf(stderr, "Could not restore hidden Recent list.\n");
+        }
+        if (!mainui_catalog_path(ui->fallback_path, ui->sd, ui->sd, "miyoo/app") ||
+            !mainui_catalog_path(ui->settings_path, ui->sd, ui->sd, "system.json") ||
+            !mainui_catalog_path(ui->default_config, ui->sd, ui->sd, ".tmp_update/config")) {
+            return 2;
+        }
+        if (!ui->base) {
+            ui->base = ui->dir ? ui->dir : ui->fallback_path;
+        }
+        if (!ui->config_dir) {
+            ui->config_dir = ui->default_config;
+        }
+        if (!ui->dir) {
+            char *text = mainui_read_text(ui->settings_path, 1024 * 1024);
+            cJSON *system_settings = text ? cJSON_Parse(text) : NULL;
+            const cJSON *active = cJSON_GetObjectItemCaseSensitive(system_settings, "theme");
+            const char *value = cJSON_IsString(active) ? active->valuestring : "";
+            ui->dir = ui->base;
+            if (*value && strcmp(value, "./")) {
+                if (mainui_catalog_path(ui->resolved_theme, ui->sd, ui->sd, value)) {
+                    ui->dir = ui->resolved_theme;
+                }
+                else {
+                    /* Like a missing theme folder: the stock theme still starts. */
+                    fprintf(stderr, "Ignoring unusable theme path in system.json: %.80s\n", value);
+                }
+            }
+            cJSON_Delete(system_settings);
+            free(text);
+        }
+    }
+    if (!ui->base) {
+        ui->base = ui->dir;
+    }
+    if (ui->config_dir) {
+        mainui_config_load(&ui->config, ui->config_dir);
+        mainui_game_menu_load(&ui->game_menu, ui->config_dir);
+        mainui_console_view_load(&ui->console_view, ui->config_dir);
+    }
+    else {
+        mainui_config_parse(&ui->config, NULL, NULL, NULL, NULL);
+        mainui_game_menu_defaults(&ui->game_menu);
+        mainui_console_view_parse(&ui->console_view, NULL);
+    }
+    /* Console thumbnails: a path as config.json paths are written, absolute
+     * (/mnt/SDCARD/...) or from the SD card's root, found on this host. */
+    char thumbs[MAINUI_PATH_MAX];
+    if (*ui->console_view.thumbs && ui->sd &&
+        mainui_catalog_path(thumbs, ui->sd, ui->sd, ui->console_view.thumbs)) {
+        strcpy(ui->console_view.thumbs, thumbs);
+    }
+    else {
+        ui->console_view.thumbs[0] = 0;
+    }
+    ui->list = calloc(1, sizeof *ui->list);
+    ui->catalog = ui->sd ? calloc(1, sizeof *ui->catalog) : NULL;
+    bool catalog_ok =
+        ui->catalog && mainui_catalog_open(ui->catalog, ui->sd, ui->config.case_sensitive);
+    if (ui->catalog && !catalog_ok && ui->catalog->unreadable) {
+        /* An unusable Emu leaves an empty Games list; Apps, settings and
+         * shutdown still work, which beats a launcher that cannot start. */
+        fprintf(stderr, "%s; starting with an empty Games list\n", ui->catalog->error);
+        catalog_ok = true;
+    }
+    if (!ui->list || (ui->sd && !catalog_ok) ||
+        (!ui->sd && !mainui_load_list(ui->list, ui->list_path))) {
+        fprintf(stderr, "%s\n",
+                ui->catalog ? ui->catalog->error : "Cannot read list or allocate catalog");
+        if (ui->catalog) {
+            mainui_catalog_close(ui->catalog);
+        }
+        free(ui->catalog);
+        if (ui->list) {
+            mainui_close_list(ui->list);
+        }
+        free(ui->list);
+        return 2;
+    }
+    if (ui->refresh_caches && ui->catalog &&
+        !mainui_browser_refresh_all(ui->sd, ui->config.case_sensitive, ui->catalog->error)) {
+        fprintf(stderr, "%s\n", ui->catalog->error);
+        mainui_catalog_close(ui->catalog);
+        free(ui->catalog);
+        mainui_close_list(ui->list);
+        free(ui->list);
+        return 4;
+    }
+    if (ui->system_name) {
+        int found = -1;
+        for (int i = 0; i < ui->catalog->pages[0].count; i++) {
+            if (!strcmp(ui->catalog->pages[0].entries[i].label, ui->system_name)) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0 || !mainui_catalog_enter(ui->catalog, found)) {
+            fprintf(stderr, "Cannot open requested system: %s\n", ui->system_name);
+            mainui_catalog_close(ui->catalog);
+            free(ui->catalog);
+            mainui_close_list(ui->list);
+            free(ui->list);
+            return 2;
+        }
+        mainui_grid_restore(&ui->catalog->pages[0].view, ui->catalog->pages[0].count, found, 4, 2);
+    }
+    return -1;
+}
+
+int mainui_setup_video(MainUIApp *ui)
+{
+    if (ui->snapshot) {
+        SDL_putenv("SDL_VIDEODRIVER=dummy");
+    }
+#ifdef MAINUI_XGB35
+    xgb35_pre_sdl_init(ui->real_device && !ui->snapshot);
+#endif
+#ifdef MAINUI_ONION
+    /* Reset before SDL saves the framebuffer settings, so SDL_Quit restores
+     * pan 0 rather than a killed RetroArch's buffer (a brief flash of its last
+     * frame on exit). The resets after SDL_SetVideoMode and SDL_Quit stay. */
+    if (ui->real_device && !ui->snapshot) {
+        mainui_reset_framebuffer_pan("before SDL");
+    }
+#endif
+    long long t0 = startup_ms();
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0) {
+        fprintf(stderr, "SDL: %s\n", SDL_GetError());
+        if (ui->catalog) {
+            mainui_catalog_close(ui->catalog);
+        }
+        free(ui->catalog);
+        mainui_close_list(ui->list);
+        free(ui->list);
+        return 3;
+    }
+    long long t1 = startup_ms();
+    if (TTF_Init() < 0) {
+        fprintf(stderr, "TTF: %s\n", TTF_GetError());
+        quit_sdl(ui);
+        if (ui->catalog) {
+            mainui_catalog_close(ui->catalog);
+        }
+        free(ui->catalog);
+        mainui_close_list(ui->list);
+        free(ui->list);
+        return 3;
+    }
+    long long t2 = startup_ms();
+    /* Request the real device surface; our software screen already buffers
+     * drawing. Host and deterministic snapshots retain software video. */
+    Uint32 video_flags = ui->real_device && !ui->snapshot ? SDL_HWSURFACE : SDL_SWSURFACE;
+    ui->display = SDL_SetVideoMode(640, 480, 32, video_flags);
+    long long t3 = startup_ms();
+#ifdef MAINUI_ONION
+    if (ui->display && ui->real_device) {
+        mainui_reset_framebuffer_pan("startup");
+    }
+#endif
+    ui->screen = ui->display;
+    if (ui->display && ui->real_device) {
+        ui->screen = SDL_CreateRGBSurface(
+            SDL_SWSURFACE, 640, 480, ui->display->format->BitsPerPixel, ui->display->format->Rmask,
+            ui->display->format->Gmask, ui->display->format->Bmask, 0);
+    }
+    if (!ui->screen || !mainui_theme_open_sd(&ui->theme, ui->dir, ui->base, ui->sd, &ui->config)) {
+        fprintf(stderr, "Cannot initialize theme/display: %s\n",
+                ui->screen && *ui->theme.error ? ui->theme.error : SDL_GetError());
+        if (ui->screen && ui->screen != ui->display) {
+            SDL_FreeSurface(ui->screen);
+        }
+        TTF_Quit();
+        quit_sdl(ui);
+        if (ui->catalog) {
+            mainui_catalog_close(ui->catalog);
+        }
+        free(ui->catalog);
+        mainui_close_list(ui->list);
+        free(ui->list);
+        return 3;
+    }
+    if (ui->sd) {
+        mainui_language_load(ui->sd, ui->theme.fallback);
+    }
+    /* Which build runs where, for reports that come with only a log. */
+    fprintf(stderr, "[startup] Open MainUI %s, device %d, sd %s, theme %s\n", MAINUI_VERSION,
+            ui->device_status.model.id, ui->sd ? ui->sd : "-", ui->theme.directory);
+    /* Kept deliberately for startup timing diagnostics. */
+    fprintf(stderr, "[startup] sdl-init %lld ttf-init %lld set-mode %lld theme %lld\n", t1 - t0,
+            t2 - t1, t3 - t2, startup_ms() - t3);
+    SDL_WM_SetCaption("Open MainUI", NULL);
+    SDL_EnableKeyRepeat(ui->config.repeat_delay, ui->config.repeat_interval);
+    SDL_EnableUNICODE(1);
+    return -1;
+}
+
+/* The return from a launch of Onion's Search tool (search, clear, or its
+ * settings), as opposed to a game Search found. */
+static const char *search_action(const cJSON *record)
+{
+    const cJSON *tool = cJSON_GetObjectItemCaseSensitive(record, "launch");
+    const cJSON *rom = cJSON_GetObjectItemCaseSensitive(record, "rompath");
+    return cJSON_IsString(tool) && cJSON_IsString(rom) &&
+                   !strcmp(tool->valuestring, "/mnt/SDCARD/App/Search/launch.sh")
+               ? rom->valuestring
+               : NULL;
+}
+
+static bool search_setstate_return(const cJSON *record)
+{
+    const char *rom = search_action(record);
+    return rom && !strncmp(rom, "setstate:", 9);
+}
+
+static bool search_tool_return(const cJSON *record)
+{
+    const char *rom = search_action(record);
+    return rom && (!strcmp(rom, "/mnt/SDCARD/App/Search/launch.sh") || !strcmp(rom, "search") ||
+                   !strcmp(rom, "clear") || strstr(rom, "/App/Search/data/") ||
+                   cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(record, "app_action")));
+}
+
+/* The stock state.json, which stock MainUI follows when it starts. Onion's
+ * X-button shortcut (keymon) starts Search by killing MainUI, so no return
+ * envelope exists; Search then leaves Games -> Search there. That state names
+ * the console only by its label: copy it out for comparing with the Search
+ * system found by its data folder (empty unless the last screen is a console
+ * list). Onion's setState, run at boot for the startup tab and by its Expert
+ * app, leaves the main menu and one tab. Returns that tab, or -1. */
+static int stock_state_read(const char *directory, char label[256], int *console_type)
+{
+    label[0] = 0;
+    *console_type = 0;
+    char path[4096];
+    if (snprintf(path, sizeof path, "%s/state.json", directory) >= (int)sizeof path) {
+        return -1;
+    }
+    char *text = mainui_read_text(path, 64 * 1024);
+    cJSON *root = text ? cJSON_Parse(text) : NULL;
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(root, "list");
+    int count = cJSON_GetArraySize(list);
+    const cJSON *last = cJSON_GetArrayItem(list, count - 1);
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(last, "type");
+    int last_type = cJSON_IsNumber(type) ? type->valueint : -1;
+    const cJSON *name =
+        cJSON_GetObjectItemCaseSensitive(last, last_type == 17 ? "raname" : "emuname");
+    if (count == 3 && (last_type == 5 || last_type == 17) && cJSON_IsString(name) &&
+        *name->valuestring && strlen(name->valuestring) < 256) {
+        snprintf(label, 256, "%s", name->valuestring);
+        *console_type = last_type;
+    }
+    /* setState's page types, in stock's numbering. */
+    static const int types[] = {10, 2, 1, 16, 3};
+    static const MainUIMenuSection tabs[] = {MAINUI_MENU_RECENTS, MAINUI_MENU_FAVORITES,
+                                             MAINUI_MENU_GAMES, MAINUI_MENU_EXPERT,
+                                             MAINUI_MENU_APPS};
+    int tab = -1;
+    for (int i = 0; count == 2 && cJSON_IsNumber(type) && i < 5; ++i) {
+        if (type->valueint == types[i]) {
+            tab = tabs[i];
+        }
+    }
+    cJSON_Delete(root);
+    free(text);
+    return tab;
+}
+
+/* Labels as stock pads them (" Search "), compared without the padding. */
+static bool same_label(const char *a, const char *b)
+{
+    while (*a == ' ') {
+        a++;
+    }
+    while (*b == ' ') {
+        b++;
+    }
+    size_t la = strlen(a), lb = strlen(b);
+    while (la && a[la - 1] == ' ') {
+        la--;
+    }
+    while (lb && b[lb - 1] == ' ') {
+        lb--;
+    }
+    return la == lb && !strncmp(a, b, la);
+}
+
+/* Search's "Missing caches" rows ask setState to open an emulator's ROM
+ * list. The return envelope is for the Search tool, but that request is not
+ * a normal Search return: follow its three-frame state.json instead. Validate
+ * both the state and the requested emulator directory before switching pages. */
+static bool follow_search_setstate(MainUIApp *ui, const cJSON *record, int type, const char *label)
+{
+    const char *action = search_action(record);
+    if (!action || strncmp(action, "setstate:", 9) || !*label || (type != 5 && type != 17)) {
+        return false;
+    }
+    const char *path = action + 9;
+    const char *separator = strrchr(path, ':');
+    if (!separator || separator == path || !separator[1] || !same_label(label, separator + 1)) {
+        return false;
+    }
+    char raw[MAINUI_PATH_MAX], directory[MAINUI_PATH_MAX];
+    size_t length = (size_t)(separator - path);
+    if (length >= sizeof raw) {
+        return false;
+    }
+    memcpy(raw, path, length);
+    raw[length] = 0;
+    if (!mainui_catalog_path(directory, ui->sd, ui->sd, raw)) {
+        return false;
+    }
+    MainUICatalog *catalog = calloc(1, sizeof *catalog);
+    if (!catalog) {
+        return false;
+    }
+    bool ok = type == 17 ? mainui_catalog_expert(catalog, ui->sd, ui->config.case_sensitive)
+                         : mainui_catalog_open(catalog, ui->sd, ui->config.case_sensitive);
+    int index = -1;
+    for (int i = 0; ok && i < catalog->pages[0].count; ++i) {
+        const MainUIEntry *entry = &catalog->pages[0].entries[i];
+        /* setstate names the console's Emu or RApp folder, the one holding
+         * its config.json; its path is its ROM folder. */
+        const char *slash = entry->config ? strrchr(entry->config, '/') : NULL;
+        size_t folder = slash ? (size_t)(slash - entry->config) : 0;
+        if (slash && strlen(directory) == folder && !strncmp(entry->config, directory, folder) &&
+            same_label(entry->label, label)) {
+            index = i;
+            break;
+        }
+    }
+    MainUIViewport view = {0};
+    if (index >= 0) {
+        mainui_browser_grid_restore(catalog, &view, index);
+        ok = mainui_browser_enter(catalog, &view, ui->config.rows);
+    }
+    else {
+        ok = false;
+    }
+    if (!ok) {
+        mainui_catalog_close(catalog);
+        free(catalog);
+        return false;
+    }
+
+    if (ui->library == ui->search.results) {
+        ui->library = NULL;
+    }
+    mainui_search_close(&ui->search);
+    if (ui->library) {
+        mainui_library_close(ui->library);
+        free(ui->library);
+        ui->library = NULL;
+    }
+    if (ui->apps) {
+        mainui_catalog_close(ui->apps);
+        free(ui->apps);
+        ui->apps = NULL;
+    }
+    MainUICatalog **target = type == 17 ? &ui->expert : &ui->games;
+    if (*target) {
+        mainui_catalog_close(*target);
+        free(*target);
+    }
+    *target = ui->catalog = catalog;
+    if (type == 17) {
+        ui->expert_view = view;
+    }
+    else {
+        ui->games_view = view;
+    }
+    ui->console_position_pending[type == 17 ? MAINUI_POSITION_EXPERT : MAINUI_POSITION_GAMES] =
+        false;
+    ui->view = view;
+    ui->home = ui->settings_open = false;
+    ui->cached_start = -1;
+    ui->preview_sync_once = true;
+    fprintf(stderr, "[return] Search setstate opened %s: %s\n", type == 17 ? "Expert" : "Games",
+            label);
+    return true;
+}
+
+void mainui_restore_session(MainUIApp *ui)
+{
+    ui->preview_sync_once = true;
+    mainui_viewport_restore(
+        &ui->view, ui->catalog ? ui->catalog->pages[ui->catalog->depth].count : ui->list->count,
+        ui->config.rows, 0, 0, ui->config.rows - 1);
+    ui->home = ui->catalog && !ui->system_name && !ui->start_systems;
+    ui->settings_open = false;
+    ui->language_open = false;
+    ui->context = (MainUIContext){0};
+    ui->home_context = (MainUIContext){0};
+    mainui_context_load(&ui->home_context, ui->config_dir, ui->sd);
+    ui->context_record = NULL;
+    ui->context_open = false;
+    ui->confirmation = -1;
+    ui->settings = (MainUIStockSettings){0};
+    ui->settings_page = (MainUISettingsPage){0};
+    ui->settings_keyboard = 0;
+    ui->search = (MainUISearch){0};
+    ui->catalog_generation = 0;
+    ui->search_confirm_held = false;
+    ui->timer_interval = 0;
+    ui->search_keyboard = false;
+    ui->wifi_was_visible = false;
+    ui->apps = NULL;
+    ui->games = ui->catalog;
+    ui->expert = NULL;
+    ui->games_view = ui->view;
+    ui->expert_view = (MainUIViewport){0};
+    ui->apps_view = (MainUIViewport){0};
+    mainui_console_position_load(&ui->console_position, ui->handoff_dir);
+    for (int i = 0; i < MAINUI_POSITION_SECTIONS; ++i) {
+        ui->console_position_pending[i] = *ui->console_position.console[i];
+    }
+    memset(ui->saved_library_views, 0, sizeof ui->saved_library_views);
+    memset(ui->message_title, 0, sizeof ui->message_title);
+    memset(ui->message_body, 0, sizeof ui->message_body);
+    ui->library = NULL;
+    /* Without markers, opening a section or a menu tries again. */
+    ui->favorites = NULL;
+    mainui_markers_refresh(ui, true);
+    memset(ui->favorite_rows, 0, sizeof ui->favorite_rows);
+    ui->favorite_editor = (MainUIFavoriteEditor){0};
+    ui->name_input = (MainUINameInput){0};
+    ui->name_action = CONTEXT_FAVORITE_CREATE;
+    ui->systems_view = ui->view;
+    mainui_menu_load(&ui->menu, ui->config_dir, &ui->config);
+    mainui_viewport_restore(&ui->home_view, ui->menu.count, 4, 0, 0, 3);
+    if (ui->catalog && !ui->catalog->depth) {
+        mainui_grid_restore(&ui->view, ui->view.total, 0, 4, 2);
+    }
+    ui->theme.battery_percent = ui->battery_percent;
+    ui->theme.battery_charging =
+        ui->battery_override ? ui->battery_charging : ui->device_status.charging;
+    mainui_menu_view_open(&ui->menu_view, &ui->theme);
+    /* Snapshots and scripted input draw at once, with every icon in place. */
+    ui->menu_view.defer_selected = !ui->snapshot && !ui->input_script;
+    if (ui->handoff_dir && !ui->system_name && !ui->start_systems) {
+        cJSON *returned = mainui_launch_take_return(ui->handoff_dir);
+        /* A restored catalog is read fresh from the SD card, so it already has
+         * the Games -> Search that Search created while MainUI was away. */
+        const cJSON *return_record = cJSON_GetObjectItemCaseSensitive(returned, "record");
+        bool setstate = search_setstate_return(return_record);
+        bool from_search = search_tool_return(return_record);
+        /* No envelope: MainUI was killed, not left through its own launch. */
+        char stock_label[256] = "";
+        /* A launch still pending owns the state.json written for it: it is
+         * neither followed nor removed. */
+        char state_path[4096], pending_path[4096];
+        struct stat pending;
+        bool paths = snprintf(state_path, sizeof state_path, "%s/state.json", ui->handoff_dir) <
+                         (int)sizeof state_path &&
+                     snprintf(pending_path, sizeof pending_path, "%s/cmd_to_run.sh",
+                              ui->handoff_dir) < (int)sizeof pending_path;
+        bool idle = paths && lstat(pending_path, &pending) != 0 && errno == ENOENT;
+        int stock_type = 0;
+        int stock_tab = idle ? stock_state_read(ui->handoff_dir, stock_label, &stock_type) : -1;
+        if (returned && !setstate) {
+            stock_label[0] = 0;
+        }
+        MainUISession restored = {0};
+        bool resumed =
+            returned &&
+            mainui_session_restore(&restored, ui->sd, ui->config.case_sensitive, ui->config.rows,
+                                   cJSON_GetObjectItemCaseSensitive(returned, "resume"),
+                                   cJSON_GetObjectItemCaseSensitive(returned, "record"));
+        if (returned && !resumed) {
+            const cJSON *section = cJSON_GetObjectItemCaseSensitive(
+                cJSON_GetObjectItemCaseSensitive(returned, "resume"), "section");
+            fprintf(stderr,
+                    "[return] the saved screen (section %d) could not be restored; "
+                    "starting on Home\n",
+                    cJSON_IsNumber(section) ? section->valueint : -1);
+        }
+        if (resumed) {
+            mainui_viewport_restore(&ui->home_view, ui->menu.count, 4, restored.home.selected,
+                                    restored.home.start, restored.home.end);
+            if (restored.home_only) {
+                ui->home = true;
+            }
+            else if (restored.section == MAINUI_MENU_SETTINGS) {
+                mainui_stock_settings_load(&ui->settings, ui->config_dir, ui->sd,
+                                           ui->device_status.model.id);
+                ui->settings.selected = restored.view.selected;
+                if (ui->settings.selected < 0 || ui->settings.selected >= ui->settings.count) {
+                    ui->settings.selected = 0;
+                }
+                ui->settings.start = restored.view.start;
+                if (ui->settings.start < 0 || ui->settings.selected < ui->settings.start ||
+                    ui->settings.selected >= ui->settings.start + 6) {
+                    ui->settings.start = ui->settings.selected >= 6 ? ui->settings.selected - 5 : 0;
+                }
+                ui->home = true;
+                ui->settings_open = true;
+            }
+            else if (restored.library) {
+                ui->library = restored.library;
+                restored.library = NULL;
+                ui->systems_view = ui->view;
+                ui->view = restored.view;
+                ui->home = false;
+            }
+            else if (restored.section == MAINUI_MENU_APPS) {
+                ui->apps = restored.catalog;
+                restored.catalog = NULL;
+                ui->apps_view = restored.view;
+                ui->home = true;
+            }
+            else {
+                if (restored.section == MAINUI_MENU_EXPERT) {
+                    ui->expert = restored.catalog;
+                    ui->expert_view = restored.view;
+                    ui->console_position_pending[MAINUI_POSITION_EXPERT] = false;
+                }
+                else {
+                    mainui_catalog_close(ui->games);
+                    free(ui->games);
+                    ui->games = restored.catalog;
+                    ui->games_view = restored.view;
+                    ui->console_position_pending[MAINUI_POSITION_GAMES] = false;
+                }
+                ui->catalog = restored.catalog;
+                restored.catalog = NULL;
+                ui->view = restored.view;
+                ui->home = false;
+            }
+        }
+        const cJSON *resume = cJSON_GetObjectItemCaseSensitive(returned, "resume");
+        const cJSON *query = cJSON_GetObjectItemCaseSensitive(resume, "search_query");
+        if (!ui->home && !ui->library && cJSON_IsString(query) &&
+            mainui_search_open(&ui->search, ui->catalog, &ui->view, query->valuestring,
+                               ui->config.rows)) {
+            if (mainui_search_restore_view(
+                    &ui->search, cJSON_GetObjectItemCaseSensitive(resume, "search_view"),
+                    cJSON_GetObjectItemCaseSensitive(returned, "record"), ui->config.rows)) {
+                ui->library = ui->search.results;
+                ui->view = ui->search.view;
+            }
+            else {
+                fprintf(stderr, "[return] the Search results could not be restored\n");
+                mainui_search_close(&ui->search);
+            }
+        }
+        else if (!ui->home && !ui->library && cJSON_IsString(query)) {
+            fprintf(stderr, "[return] the Search results could not be reopened\n");
+        }
+        /* A Missing caches action leaves the target console as the last
+         * state.json frame. Do not treat it as an ordinary Search return. */
+        if (setstate && idle && stock_type &&
+            !follow_search_setstate(ui, return_record, stock_type, stock_label)) {
+            fprintf(stderr, "[return] Search setstate destination unavailable\n");
+        }
+        /* After Search started by keymon: only if the stock state names the
+         * console that is the Search system. */
+        bool stock_search = false;
+        for (int i = 0; *stock_label && i < ui->games->pages[0].count && !stock_search; ++i) {
+            stock_search = mainui_catalog_search_system(ui->games, i) &&
+                           same_label(ui->games->pages[0].entries[i].label, stock_label);
+        }
+        if (stock_search && !from_search) {
+            fprintf(stderr, "[return] no return file; following the stock state.json to "
+                            "Games -> Search\n");
+        }
+        if (from_search || stock_search) {
+            bool found = false;
+            while (ui->games->depth) {
+                mainui_catalog_back(ui->games);
+            }
+            for (int i = 0; i < ui->games->pages[0].count; ++i) {
+                if (mainui_catalog_search_system(ui->games, i)) {
+                    found = true;
+                    MainUIViewport target;
+                    mainui_grid_restore(&target, ui->games->pages[0].count, i, 4, 2);
+                    if (mainui_browser_enter(ui->games, &target, ui->config.rows)) {
+                        if (ui->library == ui->search.results) {
+                            mainui_search_close(&ui->search);
+                            ui->library = NULL;
+                        }
+                        else if (ui->library) {
+                            mainui_library_close(ui->library);
+                            free(ui->library);
+                            ui->library = NULL;
+                        }
+                        if (ui->apps) {
+                            mainui_catalog_close(ui->apps);
+                            free(ui->apps);
+                            ui->apps = NULL;
+                        }
+                        ui->catalog = ui->games;
+                        ui->view = ui->games_view = target;
+                        ui->console_position_pending[MAINUI_POSITION_GAMES] = false;
+                        ui->home = ui->settings_open = false;
+                    }
+                    else {
+                        fprintf(stderr, "Search returned, but Games -> Search did not open: %s\n",
+                                ui->games->error);
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                /* After Clear search, for example: the ordinary list stands. */
+                fprintf(stderr, "Search returned; Games has no Search entry\n");
+            }
+        }
+        /* A tab left by setState opens, as in stock: at boot the startup tab
+         * set in Tweaks, after keymon killed MainUI for a shortcut to Onion's
+         * Expert app, or on return from that app started from Apps (MainUI's
+         * own launch from Apps left Apps there). */
+        bool from_apps = resumed && restored.section == MAINUI_MENU_APPS;
+        if (stock_tab >= 0 && (!returned || (from_apps && stock_tab != MAINUI_MENU_APPS)) &&
+            !from_search && !stock_search && ui->home && !ui->settings_open) {
+            fprintf(stderr, "[return] following the stock state.json to %s\n",
+                    mainui_menu_label(stock_tab));
+            if (ui->apps) {
+                mainui_catalog_close(ui->apps);
+                free(ui->apps);
+                ui->apps = NULL;
+            }
+            for (int i = 0; i < ui->menu.count; ++i) {
+                if (ui->menu.sections[i] == (MainUIMenuSection)stock_tab) {
+                    mainui_viewport_move(&ui->home_view, 4, i - ui->home_view.selected, false);
+                    break;
+                }
+            }
+            mainui_screen_home_key(ui, SDLK_RETURN, stock_tab);
+        }
+        /* Read once, as stock unlinks it after restoring: a later start
+         * without a new state (after keymon's GameSwitcher, say) is on Home. */
+        if (idle) {
+            mainui_remove_file(state_path);
+        }
+        mainui_session_close(&restored);
+        cJSON_Delete(returned);
+    }
+}
+
+void mainui_setup_render(MainUIApp *ui)
+{
+    memset(ui->labels, 0, sizeof ui->labels);
+    memset(ui->highlighted, 0, sizeof ui->highlighted);
+    ui->cached_start = -1;
+    ui->status = 0;
+    ui->heading_color = ui->theme.title_color;
+    /* Opening a startup tab (Recents, Favorites) may have drawn one already. */
+    if (ui->heading) {
+        SDL_FreeSurface(ui->heading);
+    }
+    ui->heading = TTF_RenderUTF8_Blended(ui->theme.title_font,
+                                         ui->search.results ? ui->search.title
+                                         : ui->library      ? mainui_library_heading(ui->library)
+                                         : ui->catalog      ? mainui_catalog_heading(ui->catalog)
+                                                            : "Games",
+                                         ui->heading_color);
+    ui->timer = NULL;
+    ui->selected_at = SDL_GetTicks();
+    /* Keymon's long press of Menu arrives as a lone release, which SDL drops;
+     * read Menu releases from the input device itself (platform/menu_button.h). */
+#ifdef MAINUI_XGB35
+    xgb35_post_sdl_init(ui->real_device && !ui->snapshot);
+#else
+    if (ui->real_device && !ui->snapshot && !mainui_menu_button_open("/dev/input/event0")) {
+        fprintf(stderr, "Cannot read Menu releases from /dev/input/event0; Menu opens no "
+                        "context menu\n");
+    }
+#endif
+    /* Stock reads keymon's audiofix before loading system.json over it, and
+     * opens the mixer with 4096 sample frames with Onion's audio fix (its
+     * audioserver) off, as here, and 128 with it on. Here it is 1024 with it
+     * on, on purpose: 128 wakes the audio callback eight times as often and
+     * raised MainUI's idle CPU use (1.6 % against 0.9 % with 1.0.7's 1024,
+     * which played without problems). The latency stays about 21 ms at
+     * 48 kHz, unnoticeable for theme sounds and music. Read like stock, from
+     * the value keymon already has; the host keeps 1024. */
+    int audiofix = -1;
+    if (ui->real_device && !ui->snapshot &&
+        !mainui_device_setting_value(&ui->device_adapter, "audiofix", &audiofix)) {
+        audiofix = -1;
+    }
+    /* As stock at start: the button mapping in system.json goes to the button
+     * driver, which remaps the buttons (X as B, say) for every program. Nothing
+     * else in Onion writes it. */
+    /* As stock at every start: keymon's live settings from system.json, and
+     * the display brightness from them. */
+    if (ui->real_device && !ui->snapshot && ui->sd &&
+        !mainui_device_settings_load(&ui->device_adapter, ui->sd)) {
+        fprintf(stderr, "Cannot load the live settings from system.json\n");
+    }
+    if (ui->real_device && !ui->snapshot && ui->sd &&
+        !mainui_keymap_apply(ui->sd, "/sys/module/gpio_keys_polled/parameters/button_config")) {
+        fprintf(stderr, "Cannot hand the button mapping to the button driver\n");
+    }
+    /* Snapshot tests stay silent. Playback is optional on the host. */
+    if (!ui->snapshot) {
+        cJSON *system_config = mainui_system_read(ui->sd ? ui->sd : ".");
+        /* Stock's 8 when the value is missing or not a number. */
+        int level = mainui_system_monitor_value(system_config, "bgmvol");
+        if (ui->real_device && audiofix < 0) {
+            audiofix = mainui_system_monitor_value(system_config, "audiofix");
+        }
+        int chunk = audiofix == 0 ? 4096 : 1024;
+        /* mainui_audio_open() logs the specific reason. */
+        mainui_audio_open(ui->theme.directory, ui->theme.fallback, level, chunk);
+        cJSON_Delete(system_config);
+    }
+    mainui_audio_pause(ui->device_enabled && ui->device_status.sleeping == 1);
+    ui->sound_selection = -1;
+    ui->sound_section = -1;
+    ui->running = true;
+    ui->launch_pending = false;
+    ui->letter_jump = (MainUILetterJump){0};
+    memset(ui->held, 0, sizeof ui->held);
+    if (ui->device_enabled) {
+        mainui_about_start(&ui->about_job, &ui->device_adapter, ui->sd);
+    }
+    /* Stock's start-up line, printed before its first frame. Onion's clock
+     * overlay (libmainuihooks.so, preloaded) waits for this printf format
+     * before it draws the time on each SDL_Flip. Called through a pointer:
+     * a fortified build would call __printf_chk, which it does not see. */
+    if (ui->real_device && !ui->snapshot) {
+        int (*volatile print)(const char *, ...) = printf;
+        print("%d run windows\n", 1);
+        fflush(stdout);
+    }
+}
+
+int mainui_teardown(MainUIApp *ui)
+{
+    mainui_menu_button_close();
+    /* A launch saved it already, for the same view: no input came since. */
+    if (ui->catalog && !ui->library && !ui->home && !ui->snapshot && !ui->launch_pending &&
+        !mainui_positions_save(ui->catalog, &ui->view)) {
+        fprintf(stderr, "Could not save ROM-list position on exit.\n");
+    }
+    mainui_about_close(&ui->about_job);
+    mainui_device_job_close(&ui->device_job);
+    mainui_catalog_job_close(&ui->catalog_job);
+    if (ui->timer) {
+        SDL_RemoveTimer(ui->timer);
+        ui->timer = 0;
+    }
+#ifdef MAINUI_ONION
+    /* The loop has already submitted the launch blank. Stop every SDL caller before
+     * releasing the device video/audio drivers, then skip unrelated memory
+     * cleanup. Host and snapshot runs retain full cleanup for leak checking. */
+    if (ui->launch_pending && !ui->snapshot && ui->status == 0) {
+        if (ui->preview.thread) {
+            SDL_WaitThread(ui->preview.thread, NULL);
+            ui->preview.thread = NULL;
+        }
+        /* A list's video decoder and the carousel's picture worker still
+         * post SDL events: stopped first. */
+        mainui_list_video_stop(&ui->list_video);
+        mainui_carousel_worker_close(&ui->menu_view.carousel_worker);
+        mainui_audio_close();
+        quit_sdl(ui);
+        mainui_mark(MAINUI_MARK_EXIT);
+        mainui_timing_report();
+        fflush(stdout);
+        fflush(stderr);
+        _Exit(0);
+    }
+#endif
+    for (int i = 0; i < 20; i++) {
+        if (ui->highlighted[i]) {
+            SDL_FreeSurface(ui->highlighted[i]);
+        }
+        if (ui->labels[i]) {
+            SDL_FreeSurface(ui->labels[i]);
+        }
+    }
+    if (ui->heading) {
+        SDL_FreeSurface(ui->heading);
+    }
+    if (ui->library) {
+        mainui_favorite_editor_close(&ui->favorite_editor);
+        mainui_library_close(ui->library);
+    }
+    free(ui->library);
+    if (ui->favorites) {
+        mainui_library_close(ui->favorites);
+    }
+    free(ui->favorites);
+    if (ui->apps) {
+        mainui_catalog_close(ui->apps);
+    }
+    free(ui->apps);
+    cJSON_Delete(ui->context_record);
+    mainui_name_input_close(&ui->name_input);
+    mainui_favorite_editor_close(&ui->favorite_editor);
+    mainui_languages_close(&ui->languages);
+    mainui_language_close();
+    mainui_list_video_stop(&ui->list_video);
+    mainui_details_close(&ui->details);
+    mainui_gamelist_metadata_close();
+    mainui_preview_close(&ui->preview);
+    mainui_menu_view_close(&ui->menu_view);
+    mainui_audio_close();
+    mainui_theme_close(&ui->theme);
+    if (ui->screen != ui->display) {
+        SDL_FreeSurface(ui->screen);
+    }
+    TTF_Quit();
+    quit_sdl(ui);
+    if (ui->catalog) {
+        mainui_catalog_close(ui->catalog);
+    }
+    if (ui->expert && ui->expert != ui->catalog) {
+        mainui_catalog_close(ui->expert);
+    }
+    if (ui->games && ui->games != ui->catalog) {
+        mainui_catalog_close(ui->games);
+    }
+    free(ui->expert);
+    free(ui->games);
+    mainui_close_list(ui->list);
+    free(ui->list);
+    mainui_mark(MAINUI_MARK_EXIT);
+    mainui_timing_report();
+    return ui->status;
+}

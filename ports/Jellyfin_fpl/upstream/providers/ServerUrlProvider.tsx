@@ -1,0 +1,152 @@
+import { useAtomValue } from "jotai";
+import type React from "react";
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useWifiSSID } from "@/hooks/useWifiSSID";
+import { apiAtom, useJellyfin } from "@/providers/JellyfinProvider";
+import { storage } from "@/utils/mmkv";
+import { getServerLocalConfig } from "@/utils/secureCredentials";
+import { isHttpUrl } from "@/utils/serverUrl/candidates";
+
+interface ServerUrlContextValue {
+  effectiveServerUrl: string | null;
+  isUsingLocalUrl: boolean;
+  currentSSID: string | null;
+  connectedToWifi: boolean;
+  refreshUrlState: () => void;
+}
+
+const ServerUrlContext = createContext<ServerUrlContextValue | null>(null);
+
+const DEBOUNCE_MS = 500;
+
+interface Props {
+  children: ReactNode;
+}
+
+export function ServerUrlProvider({ children }: Props): React.ReactElement {
+  const api = useAtomValue(apiAtom);
+  const { switchServerUrl } = useJellyfin();
+  const { ssid, connectedToWifi, permissionStatus } = useWifiSSID();
+
+  const [isUsingLocalUrl, setIsUsingLocalUrl] = useState(false);
+  const [effectiveServerUrl, setEffectiveServerUrl] = useState<string | null>(
+    null,
+  );
+
+  const remoteUrlRef = useRef<string | null>(null);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSSIDRef = useRef<string | null>(null);
+  // A ref, not a dependency: a new evaluator re-runs the debounce effect, whose
+  // cleanup would drop a pending evaluation.
+  const basePathRef = useRef(api?.basePath);
+  basePathRef.current = api?.basePath;
+
+  // Sync remoteUrl from storage when api changes
+  useEffect(() => {
+    const storedUrl = storage.getString("serverUrl");
+    if (storedUrl) {
+      remoteUrlRef.current = storedUrl;
+    }
+    if (api?.basePath && !effectiveServerUrl) {
+      setEffectiveServerUrl(api.basePath);
+    }
+  }, [api?.basePath, effectiveServerUrl]);
+
+  // Function to evaluate and switch URL based on current config and SSID
+  const evaluateAndSwitchUrl = useCallback(() => {
+    // Read now rather than when the api last changed: the remote address can
+    // be replaced in storage while the app stays on the local one (a server
+    // moved off a legacy route prefix), and the ref would still name the old.
+    const remoteUrl = storage.getString("serverUrl") || remoteUrlRef.current;
+    if (!remoteUrl || !switchServerUrl) return;
+
+    const config = getServerLocalConfig(remoteUrl);
+    // Installs hold local URLs saved before the settings field checked them,
+    // some without a scheme. One of those as the API base path fails every
+    // request and crashed the app at launch, so it is never switched to: the
+    // remote URL keeps the app working, and the settings screen flags it.
+    const shouldUseLocal = Boolean(
+      config?.enabled &&
+        isHttpUrl(config.localUrl) &&
+        ssid !== null &&
+        config.homeWifiSSIDs.includes(ssid),
+    );
+
+    const targetUrl = shouldUseLocal ? config!.localUrl : remoteUrl;
+
+    // A switch builds a new api, which reopens the WebSocket. The api drops one
+    // trailing slash from its base path, so compare without it.
+    if (targetUrl.replace(/\/$/, "") !== basePathRef.current) {
+      switchServerUrl(targetUrl);
+    }
+    setIsUsingLocalUrl(shouldUseLocal);
+    setEffectiveServerUrl(targetUrl);
+  }, [ssid, switchServerUrl]);
+
+  // Manual refresh function for when config changes
+  const refreshUrlState = useCallback(() => {
+    evaluateAndSwitchUrl();
+  }, [evaluateAndSwitchUrl]);
+
+  // Debounced SSID change handler
+  useEffect(() => {
+    if (permissionStatus !== "granted") return;
+    if (ssid === lastSSIDRef.current) return;
+
+    lastSSIDRef.current = ssid;
+
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    debounceTimerRef.current = setTimeout(() => {
+      evaluateAndSwitchUrl();
+    }, DEBOUNCE_MS);
+
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, [ssid, permissionStatus, evaluateAndSwitchUrl]);
+
+  const value = useMemo(
+    () => ({
+      effectiveServerUrl,
+      isUsingLocalUrl,
+      currentSSID: ssid,
+      connectedToWifi,
+      refreshUrlState,
+    }),
+    [
+      effectiveServerUrl,
+      isUsingLocalUrl,
+      ssid,
+      connectedToWifi,
+      refreshUrlState,
+    ],
+  );
+
+  return (
+    <ServerUrlContext.Provider value={value}>
+      {children}
+    </ServerUrlContext.Provider>
+  );
+}
+
+export function useServerUrl(): ServerUrlContextValue {
+  const context = useContext(ServerUrlContext);
+  if (!context) {
+    throw new Error("useServerUrl must be used within ServerUrlProvider");
+  }
+  return context;
+}

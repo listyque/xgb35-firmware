@@ -1,0 +1,119 @@
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models";
+import { act, renderHook } from "@testing-library/react-native";
+import { useShuffleQueue } from "./useShuffleQueue";
+
+const mockPlayMedia = jest.fn();
+const mockSetShuffleQueue = jest.fn();
+// getDefaultPlaySettings always hands a quality back, Auto at the least.
+const AUTO = { key: "Auto", value: undefined };
+let mockDefaultBitrate: { key: string; value?: number } = AUTO;
+
+jest.mock("@/hooks/usePlayMedia", () => ({
+  usePlayMedia: () => mockPlayMedia,
+}));
+jest.mock("jotai", () => ({
+  ...jest.requireActual("jotai"),
+  useSetAtom: () => mockSetShuffleQueue,
+}));
+jest.mock("@/hooks/useServerVersion", () => ({
+  useServerVersion: () => "12.0.0",
+}));
+jest.mock("@/utils/jellyfin/getDefaultPlaySettings", () => ({
+  // Where an item starts is covered by getDefaultPlaySettings.test.ts.
+  getAdjacentStartTicks: (item: BaseItemDto) =>
+    item.UserData?.PlaybackPositionTicks,
+  getDefaultPlaySettings: () => ({
+    mediaSource: { Id: "source" },
+    audioIndex: 0,
+    subtitleIndex: -1,
+    bitrate: mockDefaultBitrate,
+  }),
+}));
+jest.mock("@/utils/shuffle", () => ({
+  shuffle: (items: BaseItemDto[]) => [...items].reverse(),
+}));
+
+describe("useShuffleQueue", () => {
+  beforeEach(() => {
+    mockPlayMedia.mockReset().mockResolvedValue(undefined);
+    mockSetShuffleQueue.mockReset();
+  });
+
+  test("forwards every playable shuffled episode to the shared play queue", async () => {
+    const first: BaseItemDto = { Id: "episode-1", Type: "Episode" };
+    const second: BaseItemDto = {
+      Id: "episode-2",
+      Type: "Episode",
+      UserData: { Key: "", PlaybackPositionTicks: 40_000_000 },
+    };
+    const { result } = await renderHook(() => useShuffleQueue());
+    await act(async () => {
+      result.current.startShuffle([
+        first,
+        { Id: "missing", LocationType: "Virtual" },
+        { Name: "No item ID" },
+        second,
+      ]);
+    });
+
+    expect(mockPlayMedia).toHaveBeenCalledWith(
+      expect.objectContaining({
+        itemId: "episode-2",
+        playbackPositionTicks: 40_000_000,
+        offline: false,
+      }),
+      {
+        preserveShuffleQueue: true,
+        item: second,
+        queueItemIds: ["episode-2", "episode-1"],
+      },
+    );
+    expect(mockSetShuffleQueue).toHaveBeenCalledWith({
+      items: [second, first],
+    });
+  });
+
+  test("does not launch a queue containing only missing media", async () => {
+    const { result } = await renderHook(() => useShuffleQueue());
+    await act(async () => {
+      result.current.startShuffle([
+        { Id: "missing", LocationType: "Virtual" },
+        {},
+      ]);
+    });
+
+    expect(mockPlayMedia).not.toHaveBeenCalled();
+    expect(mockSetShuffleQueue).not.toHaveBeenCalled();
+  });
+
+  // Read as its value, Auto had none and the queue played without a cap.
+  test("starts the queue at the default quality, Auto included", async () => {
+    const { result } = await renderHook(() => useShuffleQueue());
+    await act(async () => {
+      result.current.startQueue([{ Id: "episode-1", Type: "Episode" }]);
+    });
+
+    expect(mockPlayMedia).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: "episode-1", bitrateValue: "auto" }),
+      expect.anything(),
+    );
+  });
+
+  // Saying no quality would leave it to the default, which this is already.
+  test("says Max when Max is the default quality", async () => {
+    mockDefaultBitrate = { key: "Max", value: undefined };
+    try {
+      const { result } = await renderHook(() => useShuffleQueue());
+      await act(async () => {
+        result.current.startQueue([{ Id: "episode-1", Type: "Episode" }]);
+      });
+
+      expect(mockPlayMedia).toHaveBeenCalledWith(
+        expect.objectContaining({ bitrateValue: "max" }),
+        expect.anything(),
+      );
+    } finally {
+      mockDefaultBitrate = AUTO;
+    }
+  });
+});

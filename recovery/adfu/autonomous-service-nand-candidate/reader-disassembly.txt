@@ -1,0 +1,70 @@
+b4068200 cmp r5, #0x400
+b4068204 bne #0xb406830c
+b4068208 cmp sl, #0x2000
+b406820c bne #0xb406830c
+b4068210 movw r6, #0x83e0
+b4068214 movt r6, #0xb406
+b4068218 movw r7, #0x8800
+b406821c movt r7, #0xb406
+b4068220 mov r4, #1
+b4068224 lsl r4, r4, #0xc
+b4068228 mov r8, #0x1c
+b406822c mov r0, r7
+b4068230 mov r1, #0x20
+b4068234 mcr p15, #0, r0, c7, c14, #1
+b4068238 add r0, r0, #0x20
+b406823c subs r1, r1, #1
+b4068240 bne #0xb4068234
+b4068244 dsb sy
+b4068248 strh r4, [r6]
+b406824c strh sb, [r6, #2]
+b4068250 lsr r0, sb, #0x10
+b4068254 strb r0, [r6, #4]
+b4068258 str r7, [r6, #8]
+b406825c mov r0, r6
+b4068260 mov r1, #4
+b4068264 movw ip, #0x2a00
+b4068268 movt ip, #0xffff
+b406826c blx ip
+b4068270 mov r0, r7
+b4068274 mov r1, #0x20
+b4068278 mcr p15, #0, r0, c7, c6, #1
+b406827c add r0, r0, #0x20
+b4068280 subs r1, r1, #1
+b4068284 bne #0xb4068278
+b4068288 dsb sy
+b406828c add r7, r7, r5
+b4068290 add r4, r4, r5
+b4068294 cmp r4, sl
+b4068298 moveq r4, #0
+b406829c addeq sb, sb, #1
+b40682a0 subs r8, r8, #1
+b40682a4 bne #0xb406822c
+b40682a8 movw r0, #0x8800
+b40682ac movt r0, #0xb406
+b40682b0 movw r1, #0x1c00
+b40682b4 movt r1, #0
+b40682b8 mov r2, #0
+b40682bc ldr r3, [r0], #4
+b40682c0 add r2, r2, r3
+b40682c4 subs r1, r1, #1
+b40682c8 bne #0xb40682bc
+b40682cc movw r3, #0x860e
+b40682d0 movt r3, #0xea66
+b40682d4 cmp r2, r3
+b40682d8 bne #0xb406830c
+b40682dc movw r0, #0xc7f0
+b40682e0 movt r0, #0xb406
+b40682e4 mov r1, #0
+b40682e8 str r1, [r0]
+b40682ec mcr p15, #0, r0, c7, c10, #1
+b40682f0 dsb sy
+b40682f4 mcr p15, #0, r0, c7, c5, #0
+b40682f8 dsb sy
+b40682fc isb sy
+b4068300 movw ip, #0xf500
+b4068304 movt ip, #0xb406
+b4068308 blx ip
+b406830c movw ip, #0x4a00
+b4068310 movt ip, #0xffff
+b4068314 bx ip

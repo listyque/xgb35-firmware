@@ -1,0 +1,29 @@
+{
+  "cold_ddr_pll": 10,
+  "host_execution_commands": 1,
+  "manifest_sha256": "63552bc963dbdb614a2b0b520ca8d4d8d99d30e87961faf2618fe1b17926c3d7",
+  "checks": [
+    {
+      "stage": "single_handoff_accepted"
+    },
+    {
+      "stage": "autonomous_DDR_and_USB",
+      "init_report": "315455410300000000000000000000008bff07000000000000000000000000000a0300000000000002000000000000000000600000000000007e0000e2030000",
+      "calibration_parameter_changes": [
+        42,
+        43,
+        45
+      ],
+      "new_host_process": false
+    },
+    {
+      "rounds": 64,
+      "bytes_per_round": 4096,
+      "seconds": 0.687
+    },
+    {
+      "idle_checks": 10,
+      "USB_responds": true
+    }
+  ]
+}

@@ -1,0 +1,408 @@
+/**
+ * getDefaultPlaySettings.ts
+ *
+ * Determines default audio/subtitle tracks and bitrate for playback.
+ *
+ * Two use cases:
+ * 1. INITIAL PLAY: No previous state, uses media defaults + user language preferences
+ * 2. SEQUENTIAL PLAY: Has previous state (e.g., next episode), uses StreamRanker
+ *    to find matching tracks in the new media
+ */
+
+import type {
+  BaseItemDto,
+  MediaSourceInfo,
+  MediaStream,
+} from "@jellyfin/sdk/lib/generated-client";
+import { SubtitlePlaybackMode } from "@jellyfin/sdk/lib/generated-client";
+import type { Bitrate } from "@/components/BitrateSelector";
+import { AUTO_BITRATE } from "@/utils/bitrate";
+import { closestLanguageMatches, langEq } from "@/utils/jellyfin/subtitleUtils";
+import { getSeriesTrackMemory } from "@/utils/seriesTrackMemory";
+import { type Settings } from "../atoms/settings";
+import {
+  AudioStreamRanker,
+  StreamRanker,
+  SubtitleStreamRanker,
+} from "../streamRanker";
+import { isAlternateVersion } from "./mediaSourceVersion";
+import { ORIGINAL_LANGUAGE, supportsPerVersionUserData } from "./serverVersion";
+
+export interface PlaySettings {
+  item: BaseItemDto;
+  /** Auto stays Auto: the player measures it when it asks for the stream. */
+  bitrate: Bitrate;
+  mediaSource?: MediaSourceInfo | null;
+  audioIndex?: number;
+  subtitleIndex?: number;
+  /** Which tracks a previous selection or the series memory decided. */
+  carried?: { audio: boolean; subtitle: boolean };
+}
+
+export interface PreviousIndexes {
+  audioIndex?: number;
+  subtitleIndex?: number;
+}
+
+/**
+ * Find a track by language code.
+ *
+ * Comparison goes through {@link langEq} rather than string equality: the stored
+ * preference is a Jellyfin CultureDto code (.NET-style 639-2/T — "deu", "fra",
+ * "swe") while MediaStreams carry 639-2/B ("ger", "fre") or bare 639-1 ("de",
+ * "sv"). The previous `substring(0, 2)` fallback was not a language mapping at
+ * all — it turned "swe" into "sw", which is Swahili, so a Swedish preference
+ * matched Swahili tracks and missed "sv"-tagged Swedish ones.
+ *
+ * Among the matches only the closest tags compete: a remembered "pt-BR" takes
+ * the "pt-BR" track over a bare "por" one, and the other way round. The
+ * default-track rule then applies within that set.
+ *
+ * @param forcedOnly - If true, only match forced subtitles
+ */
+function findTrackByLanguage(
+  streams: MediaStream[],
+  languageCode: string | undefined,
+  streamType: "Audio" | "Subtitle",
+  forcedOnly = false,
+): number | undefined {
+  if (!languageCode) return undefined;
+
+  const candidates = closestLanguageMatches(
+    streams.filter((s) => s.Type === streamType && (!forcedOnly || s.IsForced)),
+    languageCode,
+    (s) => s.Language,
+  );
+
+  // Prefer default track if multiple match
+  const defaultTrack = candidates.find((s) => s.IsDefault);
+  return defaultTrack?.Index ?? candidates[0]?.Index;
+}
+
+/**
+ * Apply subtitle mode logic to determine the final subtitle index.
+ *
+ * @param streams - Available media streams
+ * @param settings - User settings containing subtitleMode
+ * @param defaultIndex - The current default subtitle index
+ * @param audioLanguage - The selected audio track's language (for Smart mode)
+ * @param subtitleLanguageCode - The user's preferred subtitle language
+ * @returns The final subtitle index (-1 for disabled)
+ */
+function applySubtitleMode(
+  streams: MediaStream[],
+  settings: Settings,
+  defaultIndex: number,
+  audioLanguage: string | undefined,
+  subtitleLanguageCode: string | undefined,
+): number {
+  const subtitleStreams = streams.filter((s) => s.Type === "Subtitle");
+  const mode = settings.subtitleMode ?? SubtitlePlaybackMode.Default;
+
+  switch (mode) {
+    case SubtitlePlaybackMode.None:
+      // Always disable subtitles
+      return -1;
+
+    case SubtitlePlaybackMode.OnlyForced: {
+      // Only show forced subtitles, prefer matching language
+      const forcedMatch = findTrackByLanguage(
+        streams,
+        subtitleLanguageCode,
+        "Subtitle",
+        true,
+      );
+      if (forcedMatch !== undefined) return forcedMatch;
+      // Fallback to any forced subtitle
+      const anyForced = subtitleStreams.find((s) => s.IsForced);
+      return anyForced?.Index ?? -1;
+    }
+
+    case SubtitlePlaybackMode.Always: {
+      // Always enable subtitles, prefer language match
+      const alwaysMatch = findTrackByLanguage(
+        streams,
+        subtitleLanguageCode,
+        "Subtitle",
+      );
+      if (alwaysMatch !== undefined) return alwaysMatch;
+      // Fallback to first available or current default
+      return subtitleStreams[0]?.Index ?? defaultIndex;
+    }
+
+    case SubtitlePlaybackMode.Smart: {
+      // Enable subtitles only when audio language differs from subtitle preference
+      if (audioLanguage && subtitleLanguageCode) {
+        // If audio matches subtitle preference, disable subtitles
+        if (langEq(audioLanguage, subtitleLanguageCode)) {
+          return -1;
+        }
+      }
+      // Audio doesn't match preference, enable subtitles
+      const smartMatch = findTrackByLanguage(
+        streams,
+        subtitleLanguageCode,
+        "Subtitle",
+      );
+      return smartMatch ?? subtitleStreams[0]?.Index ?? -1;
+    }
+    default:
+      // Use language preference if set, else keep Jellyfin default
+      if (subtitleLanguageCode) {
+        const langMatch = findTrackByLanguage(
+          streams,
+          subtitleLanguageCode,
+          "Subtitle",
+        );
+        if (langMatch !== undefined) return langMatch;
+      }
+      return defaultIndex;
+  }
+}
+
+/**
+ * The version of `item` matching the one played before it, by name.
+ *
+ * Jellyfin 12 groups alternate episode versions in MediaSources the way it
+ * groups movie versions, with a fresh source ID per episode. jellyfin-web's
+ * getMatchingMediaSource keeps the user's version across episodes by Name, so
+ * do the same and fall back to the first source.
+ */
+export function getMatchingMediaSource(
+  item: BaseItemDto,
+  previousSource?: MediaSourceInfo,
+): MediaSourceInfo | undefined {
+  const sources = item.MediaSources;
+  if (sources && sources.length > 1 && previousSource?.Name) {
+    const match = sources.find((s) => s.Name === previousSource.Name);
+    if (match) return match;
+  }
+  return sources?.[0];
+}
+
+/**
+ * Where to start `item` when advancing onto it with `mediaSource`.
+ *
+ * The item's UserData is its primary version's, and on Jellyfin 12 each
+ * version keeps its own, so a matched alternate version starts from the top
+ * rather than at another version's resume point. Before Jellyfin 12 the
+ * primary's is the one every version shares, and an unknown server version
+ * counts as one of those: it keeps the resume point.
+ */
+export function getAdjacentStartTicks(
+  item: BaseItemDto,
+  mediaSource: MediaSourceInfo | null | undefined,
+  offline: boolean,
+  serverVersion?: string | null,
+): number | null | undefined {
+  // Offline keeps the download record's position: its item lists every
+  // server version, so the source picked here need not be the one on disk.
+  return !offline &&
+    supportsPerVersionUserData(serverVersion) &&
+    isAlternateVersion(item.Id, item.MediaSources, mediaSource?.Id)
+    ? 0
+    : item.UserData?.PlaybackPositionTicks;
+}
+
+/**
+ * Get default play settings for an item.
+ *
+ * @param item - The media item to play
+ * @param settings - User settings (language preferences, bitrate, etc.)
+ * @param previous - Optional previous track selections to carry over (for sequential play)
+ *   and, online, the version to keep. With `pickedOn`, the indexes are picks made
+ *   for this same item on another of its versions, each on the version named.
+ */
+export function getDefaultPlaySettings(
+  item: BaseItemDto | null | undefined,
+  settings: Settings | null,
+  previous?: {
+    indexes?: PreviousIndexes;
+    source?: MediaSourceInfo;
+    // A downloaded item lists every server version, not only the one on disk.
+    offline?: boolean;
+    // Picks for this same item: carried whatever the remember settings say,
+    // which carry a track to the next item, and from the version each was
+    // picked on. The series memory still follows the remember settings.
+    pickedOn?: { audio?: MediaSourceInfo; subtitle?: MediaSourceInfo };
+  },
+): PlaySettings {
+  const bitrate = settings?.defaultBitrate ?? AUTO_BITRATE;
+
+  // Handle undefined/null item
+  if (!item) {
+    return { item: {} as BaseItemDto, bitrate };
+  }
+
+  // Live TV programs don't have media sources
+  if (item.Type === "Program") {
+    return { item, bitrate };
+  }
+
+  const mediaSource = previous?.offline
+    ? item.MediaSources?.[0]
+    : getMatchingMediaSource(item, previous?.source);
+  const streams = mediaSource?.MediaStreams ?? [];
+
+  // Start with media source defaults
+  let audioIndex = mediaSource?.DefaultAudioStreamIndex;
+  let subtitleIndex = mediaSource?.DefaultSubtitleStreamIndex ?? -1;
+
+  // Track whether we matched previous selections (for language preference fallback)
+  let matchedPreviousAudio = false;
+  let matchedPreviousSubtitle = false;
+
+  // Try to match previous selections (sequential play)
+  const picked = previous?.pickedOn;
+  const subtitleSource = picked ? picked.subtitle : previous?.source;
+  const audioSource = picked ? picked.audio : previous?.source;
+  if (previous?.indexes && settings) {
+    if (
+      subtitleSource &&
+      (picked || settings.rememberSubtitleSelections) &&
+      previous.indexes.subtitleIndex !== undefined
+    ) {
+      const ranker = new StreamRanker(new SubtitleStreamRanker());
+      const result = {
+        DefaultSubtitleStreamIndex: subtitleIndex,
+        matched: false,
+      };
+      ranker.rankStream(
+        previous.indexes.subtitleIndex,
+        subtitleSource,
+        streams,
+        result,
+      );
+      // Use the ranker's explicit match signal — this also covers a deliberate
+      // "subtitles off" (-1) and the case where the match equals the default.
+      if (result.matched) {
+        subtitleIndex = result.DefaultSubtitleStreamIndex;
+        matchedPreviousSubtitle = true;
+      }
+    }
+
+    if (
+      audioSource &&
+      (picked || settings.rememberAudioSelections) &&
+      previous.indexes.audioIndex !== undefined
+    ) {
+      const ranker = new StreamRanker(new AudioStreamRanker());
+      const result = { DefaultAudioStreamIndex: audioIndex, matched: false };
+      ranker.rankStream(
+        previous.indexes.audioIndex,
+        audioSource,
+        streams,
+        result,
+      );
+      // Use the ranker's explicit match signal
+      if (result.matched) {
+        audioIndex = result.DefaultAudioStreamIndex;
+        matchedPreviousAudio = true;
+      }
+    }
+  }
+
+  // Per-series memory: a track deliberately picked in the player is stored
+  // by language per series and beats server defaults on a fresh session.
+  // The sequential-play carry-over above is fresher and wins when it matched.
+  if (item.Type === "Episode" && item.SeriesId && settings) {
+    const memory = getSeriesTrackMemory(item.SeriesId);
+    if (memory) {
+      if (
+        settings.rememberAudioSelections &&
+        !matchedPreviousAudio &&
+        memory.audioLang
+      ) {
+        const match = findTrackByLanguage(streams, memory.audioLang, "Audio");
+        if (match !== undefined) {
+          audioIndex = match;
+          matchedPreviousAudio = true;
+        }
+      }
+      if (settings.rememberSubtitleSelections && !matchedPreviousSubtitle) {
+        if (memory.subtitleLang === "off") {
+          subtitleIndex = -1;
+          matchedPreviousSubtitle = true;
+        } else if (memory.subtitleLang) {
+          const match = findTrackByLanguage(
+            streams,
+            memory.subtitleLang,
+            "Subtitle",
+          );
+          if (match !== undefined) {
+            subtitleIndex = match;
+            matchedPreviousSubtitle = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Language preferences + subtitle mode, applied on every path.
+  //
+  // This used to be opt-in per caller, and the callers disagreed: the item pages
+  // and the mobile next-episode handler passed the flag while every TV and
+  // native-player next-episode handler did not. The result was that advancing an
+  // episode on Apple TV kept the *server's* DefaultSubtitleStreamIndex — which
+  // comes from the server-side user profile, a different setting the user likely
+  // never touched — and could land on a track in an unrelated language while the
+  // same show on the phone resolved correctly.
+  //
+  // Unconditional is safe: with no preference set and subtitleMode Default, both
+  // blocks below are no-ops, so only users who configured a preference see any
+  // change. The carry-over still wins where it matched (the matched* guards).
+  if (settings) {
+    const preferredAudioLanguage =
+      settings.defaultAudioLanguage?.ThreeLetterISOLanguageName ?? undefined;
+    // The original-language preference is not an ISO code: the server already
+    // resolved it into DefaultAudioStreamIndex, so leave that choice alone
+    // instead of matching the sentinel against the stream languages.
+    const audioLanguageCode =
+      preferredAudioLanguage === ORIGINAL_LANGUAGE
+        ? undefined
+        : preferredAudioLanguage;
+    const subtitleLanguageCode =
+      settings.defaultSubtitleLanguage?.ThreeLetterISOLanguageName ?? undefined;
+
+    // Apply audio language preference if no previous selection matched
+    if (!matchedPreviousAudio && audioLanguageCode) {
+      const langMatch = findTrackByLanguage(
+        streams,
+        audioLanguageCode,
+        "Audio",
+      );
+      if (langMatch !== undefined) {
+        audioIndex = langMatch;
+      }
+    }
+
+    // Get the selected audio track's language for Smart mode
+    const selectedAudioTrack = streams.find(
+      (s) => s.Type === "Audio" && s.Index === audioIndex,
+    );
+    const selectedAudioLanguage =
+      selectedAudioTrack?.Language ??
+      selectedAudioTrack?.DisplayTitle ??
+      undefined;
+
+    // Apply subtitle mode logic if no previous selection matched
+    if (!matchedPreviousSubtitle) {
+      subtitleIndex = applySubtitleMode(
+        streams,
+        settings,
+        subtitleIndex,
+        selectedAudioLanguage,
+        subtitleLanguageCode,
+      );
+    }
+  }
+
+  return {
+    item,
+    bitrate,
+    mediaSource,
+    audioIndex: audioIndex ?? undefined,
+    subtitleIndex: subtitleIndex ?? undefined,
+    carried: { audio: matchedPreviousAudio, subtitle: matchedPreviousSubtitle },
+  };
+}

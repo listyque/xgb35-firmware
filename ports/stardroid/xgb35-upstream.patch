@@ -1,0 +1,135 @@
+--- a/native/runtime.cpp
++++ b/native/runtime.cpp
+@@ -15,11 +15,15 @@
+ #define STARDROID_CONTENT_LOCALES149 1
+ #include "../vendor/libsmacker/smacker.h"
+ struct Archive {
+- int fd=-1;const uint8_t* data=nullptr;size_t size=0;
++ int fd=-1;const uint8_t* data=nullptr;size_t size=0;bool mapped=false;
+  ~Archive(){close();}
+- void close(){if(data)munmap((void*)data,size);if(fd>=0)::close(fd);data=nullptr;fd=-1;size=0;}
+- void open(const std::string& path){close();if(path.empty())return;fd=::open(path.c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("Cannot open "+path);struct stat s;if(fstat(fd,&s)||s.st_size<32)throw std::runtime_error("Invalid archive");size=s.st_size;auto* p=mmap(nullptr,size,PROT_READ,MAP_PRIVATE,fd,0);if(p==MAP_FAILED)throw std::runtime_error("Cannot map archive");data=(const uint8_t*)p;}
+- void read(void* dest,size_t offset,size_t count)const{if(!data||offset>size||count>size-offset)throw std::runtime_error("Archive read outside bounds");memcpy(dest,data+offset,count);}
++ void close(){if(mapped&&data)munmap((void*)data,size);if(fd>=0)::close(fd);data=nullptr;fd=-1;size=0;mapped=false;}
++ void open(const std::string& path){close();if(path.empty())return;fd=::open(path.c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("Cannot open "+path);struct stat s;if(fstat(fd,&s)||s.st_size<32)throw std::runtime_error("Invalid archive");size=size_t(s.st_size);
++  // On 32-bit ARMv7 (2 GB p2v8 user VA), mmap only small archives (<=16 MiB) and pread large MPQs (805MB/1GB).
++  if(size<=16u*1024u*1024u){auto* p=mmap(nullptr,size,PROT_READ,MAP_PRIVATE,fd,0);if(p!=MAP_FAILED){data=(const uint8_t*)p;mapped=true;return;}}
++  data=reinterpret_cast<const uint8_t*>(1);mapped=false;}
++ void read(void* dest,size_t offset,size_t count)const{if(!data||offset>size||count>size-offset)throw std::runtime_error("Archive read outside bounds");if(!count)return;if(mapped){memcpy(dest,data+offset,count);return;}
++  uint8_t* out=static_cast<uint8_t*>(dest);size_t done=0;while(done<count){ssize_t n=::pread(fd,out+done,count-done,off_t(offset+done));if(n<0&&errno==EINTR)continue;if(n<=0)throw std::runtime_error("Archive pread failed");done+=size_t(n);}}
+ };
+ static std::array<Archive,11> archives;
+ // One original-script opponent; -1 selects a practice game.
+@@ -258,7 +262,7 @@
+    bwgame::a_vector<uint8_t> localized;
+    if(content_languages149::read_audio(filename.c_str(),localized)){
+     if(!try_map_resource101(data,filename.c_str()))data=std::move(localized);
+-   }else for(int i:{2,1,0,4})if(read(i))break;
++   }else for(int i:{2,1,0,4,5})if(read(i))break;
+   }
+  }
+  return data;
+--- a/native/generated/wasm_backend.cpp
++++ b/native/generated/wasm_backend.cpp
+@@ -109,8 +109,30 @@
+ 
+ #define OPENBW_EXPORT(name) extern "C"
+ 
++static uint8_t* g_fb_zero_copy = nullptr;
++static bool g_fast_indexed_mode = false;
++static const uint8_t* g_idx_px = nullptr;
++static int g_idx_w = 0, g_idx_h = 0, g_idx_pitch = 0;
++static uint16_t g_idx_pal565[256] = {};
++
++extern "C" void sd_set_fast_indexed(bool on) {
++	g_fast_indexed_mode = on;
++	if (!on) g_idx_px = nullptr;
++}
++
++extern "C" const uint8_t* sd_indexed_fb(int* w, int* h, int* pitch, uint16_t* pal565_out, int* drag_rect_out) {
++	if (!g_idx_px) return nullptr;
++	if (w) *w = g_idx_w;
++	if (h) *h = g_idx_h;
++	if (pitch) *pitch = g_idx_pitch;
++	if (pal565_out) memcpy(pal565_out, g_idx_pal565, sizeof(g_idx_pal565));
++	if (drag_rect_out) drag_rect_out[0] = -1;
++	return g_idx_px;
++}
++
+ OPENBW_EXPORT(openbw_framebuffer) uint8_t* openbw_framebuffer() {
+-	return g_window ? g_window->framebuffer.data() : nullptr;
++	if (!g_window) return nullptr;
++	return g_fb_zero_copy ? g_fb_zero_copy : g_window->framebuffer.data();
+ }
+ OPENBW_EXPORT(openbw_framebuffer_width) int openbw_framebuffer_width() {
+ 	return g_window ? g_window->width : 0;
+@@ -202,6 +224,10 @@
+ 		}
+ 	}
+ 
++	~mem_surface() override {
++		if (g_fb_zero_copy == px) g_fb_zero_copy = nullptr;
++		if (g_idx_px == px) g_idx_px = nullptr;
++	}
+ 	virtual void set_palette(palette* p) override { pal = (palette_impl*)p; }
+ 	virtual void* lock() override { return px; }
+ 	virtual void unlock() override {}
+@@ -250,6 +276,58 @@
+ 		int dpitch = dst->pitch / 4;
+ 		int x0 = x < 0 ? -x : 0;                         // clamp the x span once per surface
+ 		int x1 = dst->w - x < w ? dst->w - x : w;
++		if (bpp == 4 && (blend != blend_mode::alpha || alpha_mod >= 255)) {
++			if (g_window && dst->px == g_window->framebuffer.data() &&
++			    x == 0 && y == 0 && w == dst->w && h == dst->h && pitch == dst->pitch) {
++				g_fb_zero_copy = px;
++				return;
++			}
++			if (x1 > x0) {
++				size_t row_bytes = (size_t)(x1 - x0) * 4;
++				for (int sy = 0; sy < h; ++sy) {
++					int dy = y + sy;
++					if (dy < 0 || dy >= dst->h) continue;
++					const uint32_t* srow = (const uint32_t*)(px + (size_t)sy * pitch);
++					uint32_t* drow = d + (size_t)dy * dpitch + x;
++					memcpy(drow + x0, srow + x0, row_bytes);
++				}
++			}
++			return;
++		}
++		if (bpp == 1 && (blend != blend_mode::alpha || alpha_mod >= 255)) {
++			if (g_fast_indexed_mode && x == 0 && y == 0 && w == dst->w && h == dst->h) {
++				g_idx_px = px;
++				g_idx_w = w; g_idx_h = h; g_idx_pitch = pitch;
++				if (pal) {
++					for (int i = 0; i < 256; ++i)
++						g_idx_pal565[i] = (uint16_t)(((pal->colors[i].r >> 3) << 11) | ((pal->colors[i].g >> 2) << 5) | (pal->colors[i].b >> 3));
++				}
++				return;
++			}
++			uint32_t lut[256];
++			if (pal) {
++				for (int i = 0; i < 256; ++i)
++					lut[i] = pack(pal->colors[i].r, pal->colors[i].g, pal->colors[i].b, 255);
++			} else {
++				uint32_t blk = pack(0, 0, 0, 255);
++				for (int i = 0; i < 256; ++i) lut[i] = blk;
++			}
++			for (int sy = 0; sy < h; ++sy) {
++				int dy = y + sy;
++				if (dy < 0 || dy >= dst->h) continue;
++				const uint8_t* srow = px + (size_t)sy * pitch;
++				uint32_t* drow = d + (size_t)dy * dpitch + x;
++				int sx = x0;
++				for (; sx + 4 <= x1; sx += 4) {
++					drow[sx + 0] = lut[srow[sx + 0]];
++					drow[sx + 1] = lut[srow[sx + 1]];
++					drow[sx + 2] = lut[srow[sx + 2]];
++					drow[sx + 3] = lut[srow[sx + 3]];
++				}
++				for (; sx < x1; ++sx) drow[sx] = lut[srow[sx]];
++			}
++			return;
++		}
+ 		for (int sy = 0; sy < h; ++sy) {
+ 			int dy = y + sy;
+ 			if (dy < 0 || dy >= dst->h) continue;

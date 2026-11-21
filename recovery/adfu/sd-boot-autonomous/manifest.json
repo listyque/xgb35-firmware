@@ -1,0 +1,26 @@
+{
+  "file": "sd-boot-lba1.bin",
+  "start_lba": 1,
+  "end_lba": 22361,
+  "part1_min_lba": 32768,
+  "stage1_code_bytes": 144,
+  "bytes": 11448832,
+  "sha256": "6506d8c6f384c0c6be9cf323ba4dc119be954668217d39535513260c30b4254e",
+  "segments": [
+    {
+      "lba": 68,
+      "sectors": 14560,
+      "ddr": "0x8000"
+    },
+    {
+      "lba": 14628,
+      "sectors": 7680,
+      "ddr": "0x1800000"
+    },
+    {
+      "lba": 22308,
+      "sectors": 54,
+      "ddr": "0x1e00000"
+    }
+  ]
+}

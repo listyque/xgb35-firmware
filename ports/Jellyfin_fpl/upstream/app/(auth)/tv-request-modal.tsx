@@ -1,0 +1,508 @@
+import { Ionicons } from "@expo/vector-icons";
+import { useQuery } from "@tanstack/react-query";
+import { BlurView } from "expo-blur";
+import { useAtomValue } from "jotai";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  Animated,
+  Easing,
+  ScrollView,
+  StyleSheet,
+  TVFocusGuideView,
+  View,
+} from "react-native";
+import { Text } from "@/components/common/Text";
+import { TVRequestOptionRow } from "@/components/seerr/tv/TVRequestOptionRow";
+import { TVToggleOptionRow } from "@/components/seerr/tv/TVToggleOptionRow";
+import { TVButton, TVOptionSelector } from "@/components/tv";
+import type { TVOptionItem } from "@/components/tv/TVOptionSelector";
+import { useScaledTVTypography } from "@/constants/TVTypography";
+import useRouter from "@/hooks/useAppRouter";
+import { useSeerr } from "@/hooks/useSeerr";
+import { tvRequestModalAtom } from "@/utils/atoms/tvRequestModal";
+import { canRequestForOthers, requestTagIds } from "@/utils/seerr/requests";
+import type {
+  MediaRequestBody,
+  QualityProfile,
+  RootFolder,
+  ServarrTag as Tag,
+} from "@/utils/seerr/types";
+import { store } from "@/utils/store";
+import { createSubmission } from "@/utils/submission";
+
+export default function TVRequestModalPage() {
+  const typography = useScaledTVTypography();
+  const router = useRouter();
+  const modalState = useAtomValue(tvRequestModalAtom);
+  const { t } = useTranslation();
+  const { seerrApi, seerrUser, requestMedia } = useSeerr();
+
+  const [isReady, setIsReady] = useState(false);
+  // Only what the user changes: the media itself comes from the request body
+  // the modal was opened with. No user named until one is picked: Seerr
+  // refuses a request naming one, even the caller's own, from anyone who may
+  // not request for others.
+  const [requestOverrides, setRequestOverrides] = useState<
+    Partial<MediaRequestBody>
+  >({});
+  const forOthers = canRequestForOthers(seerrUser?.permissions ?? 0);
+
+  const [activeSelector, setActiveSelector] = useState<
+    "profile" | "folder" | "user" | null
+  >(null);
+
+  const overlayOpacity = useRef(new Animated.Value(0)).current;
+  const sheetTranslateY = useRef(new Animated.Value(200)).current;
+  const submission = useRef(createSubmission()).current;
+
+  // Animate in on mount
+  useEffect(() => {
+    submission.show();
+    overlayOpacity.setValue(0);
+    sheetTranslateY.setValue(200);
+
+    Animated.parallel([
+      Animated.timing(overlayOpacity, {
+        toValue: 1,
+        duration: 250,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: true,
+      }),
+      Animated.timing(sheetTranslateY, {
+        toValue: 0,
+        duration: 300,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+
+    const timer = setTimeout(() => setIsReady(true), 100);
+    return () => {
+      clearTimeout(timer);
+      submission.dismiss();
+      store.set(tvRequestModalAtom, null);
+    };
+  }, [overlayOpacity, sheetTranslateY, submission]);
+
+  const { data: serviceSettings } = useQuery({
+    queryKey: ["seerr", "request", modalState?.mediaType, "service"],
+    queryFn: async () =>
+      seerrApi?.service(
+        modalState?.mediaType === "movie" ? "radarr" : "sonarr",
+      ),
+    enabled: !!seerrApi && !!seerrUser && !!modalState,
+  });
+
+  const { data: users } = useQuery({
+    queryKey: ["seerr", "users"],
+    queryFn: async () => seerrApi?.user({ take: 1000, sort: "displayname" }),
+    enabled: forOthers && !!seerrApi && !!seerrUser && !!modalState,
+  });
+
+  const defaultService = useMemo(
+    () => serviceSettings?.find?.((v) => v.isDefault),
+    [serviceSettings],
+  );
+
+  const { data: defaultServiceDetails } = useQuery({
+    queryKey: [
+      "seerr",
+      "request",
+      modalState?.mediaType,
+      "service",
+      "details",
+      defaultService?.id,
+    ],
+    queryFn: async () => {
+      setRequestOverrides((prev) => ({
+        ...prev,
+        serverId: defaultService?.id,
+      }));
+      return seerrApi?.serviceDetails(
+        modalState?.mediaType === "movie" ? "radarr" : "sonarr",
+        defaultService!.id,
+      );
+    },
+    enabled: !!seerrApi && !!seerrUser && !!defaultService && !!modalState,
+  });
+
+  const defaultProfile: QualityProfile | undefined = useMemo(
+    () =>
+      defaultServiceDetails?.profiles.find(
+        (p) => p.id === defaultServiceDetails.server?.activeProfileId,
+      ),
+    [defaultServiceDetails],
+  );
+
+  const defaultFolder: RootFolder | undefined = useMemo(
+    () =>
+      defaultServiceDetails?.rootFolders.find(
+        (f) => f.path === defaultServiceDetails.server?.activeDirectory,
+      ),
+    [defaultServiceDetails],
+  );
+
+  const defaultTags: Tag[] = useMemo(() => {
+    return (
+      defaultServiceDetails?.tags.filter((t) =>
+        defaultServiceDetails?.server.activeTags?.includes(t.id),
+      ) ?? []
+    );
+  }, [defaultServiceDetails]);
+
+  const pathTitleExtractor = (item: RootFolder) =>
+    `${item.path} (${item.freeSpace.bytesToReadable()})`;
+
+  // Option builders
+  const qualityProfileOptions: TVOptionItem<number>[] = useMemo(
+    () =>
+      defaultServiceDetails?.profiles.map((profile) => ({
+        label: profile.name,
+        value: profile.id,
+        selected:
+          (requestOverrides.profileId || defaultProfile?.id) === profile.id,
+      })) || [],
+    [
+      defaultServiceDetails?.profiles,
+      defaultProfile,
+      requestOverrides.profileId,
+    ],
+  );
+
+  const rootFolderOptions: TVOptionItem<string>[] = useMemo(
+    () =>
+      defaultServiceDetails?.rootFolders.map((folder) => ({
+        label: pathTitleExtractor(folder),
+        value: folder.path,
+        selected:
+          (requestOverrides.rootFolder || defaultFolder?.path) === folder.path,
+      })) || [],
+    [
+      defaultServiceDetails?.rootFolders,
+      defaultFolder,
+      requestOverrides.rootFolder,
+    ],
+  );
+
+  const userOptions: TVOptionItem<number>[] = useMemo(
+    () =>
+      users?.map((user) => ({
+        label: user.displayName,
+        value: user.id,
+        selected: (requestOverrides.userId || seerrUser?.id) === user.id,
+      })) || [],
+    [users, seerrUser, requestOverrides.userId],
+  );
+
+  const tagItems = useMemo(() => {
+    return (
+      defaultServiceDetails?.tags.map((tag) => ({
+        id: tag.id,
+        label: tag.label,
+        selected: requestTagIds(requestOverrides.tags, defaultTags).includes(
+          tag.id,
+        ),
+      })) ?? []
+    );
+  }, [defaultServiceDetails?.tags, defaultTags, requestOverrides.tags]);
+
+  // Selected display values
+  const selectedProfileName = useMemo(() => {
+    const profile = defaultServiceDetails?.profiles.find(
+      (p) => p.id === (requestOverrides.profileId || defaultProfile?.id),
+    );
+    return profile?.name || defaultProfile?.name || t("seerr.select");
+  }, [
+    defaultServiceDetails?.profiles,
+    requestOverrides.profileId,
+    defaultProfile,
+    t,
+  ]);
+
+  const selectedFolderName = useMemo(() => {
+    const folder = defaultServiceDetails?.rootFolders.find(
+      (f) => f.path === (requestOverrides.rootFolder || defaultFolder?.path),
+    );
+    return folder
+      ? pathTitleExtractor(folder)
+      : defaultFolder
+        ? pathTitleExtractor(defaultFolder)
+        : t("seerr.select");
+  }, [
+    defaultServiceDetails?.rootFolders,
+    requestOverrides.rootFolder,
+    defaultFolder,
+    t,
+  ]);
+
+  const selectedUserName = useMemo(() => {
+    const user = users?.find(
+      (u) => u.id === (requestOverrides.userId || seerrUser?.id),
+    );
+    return user?.displayName || seerrUser?.displayName || t("seerr.select");
+  }, [users, requestOverrides.userId, seerrUser, t]);
+
+  // Handlers
+  const handleProfileChange = useCallback((profileId: number) => {
+    setRequestOverrides((prev) => ({ ...prev, profileId }));
+    setActiveSelector(null);
+  }, []);
+
+  const handleFolderChange = useCallback((rootFolder: string) => {
+    setRequestOverrides((prev) => ({ ...prev, rootFolder }));
+    setActiveSelector(null);
+  }, []);
+
+  const handleUserChange = useCallback((userId: number) => {
+    setRequestOverrides((prev) => ({ ...prev, userId }));
+    setActiveSelector(null);
+  }, []);
+
+  const handleTagToggle = useCallback(
+    (tagId: number) => {
+      setRequestOverrides((prev) => {
+        const currentTags = requestTagIds(prev.tags, defaultTags);
+        const hasTag = currentTags.includes(tagId);
+        return {
+          ...prev,
+          tags: hasTag
+            ? currentTags.filter((id) => id !== tagId)
+            : [...currentTags, tagId],
+        };
+      });
+    },
+    [defaultTags],
+  );
+
+  // One request at a time, and none closing a screen once this sheet is gone.
+  const handleRequest = useCallback(async () => {
+    if (!modalState) return;
+
+    const body = {
+      is4k: defaultService?.is4k || defaultServiceDetails?.server.is4k,
+      profileId: defaultProfile?.id,
+      rootFolder: defaultFolder?.path,
+      tags: defaultTags.map((t) => t.id),
+      ...modalState.requestBody,
+      ...requestOverrides,
+    };
+
+    const seasonTitle =
+      modalState.requestBody?.seasons?.length === 1
+        ? t("seerr.season_number", {
+            season_number: modalState.requestBody.seasons[0],
+          })
+        : modalState.requestBody?.seasons &&
+            modalState.requestBody.seasons.length > 1
+          ? t("seerr.season_all")
+          : undefined;
+
+    if (!submission.start()) return;
+    await requestMedia(
+      seasonTitle ? `${modalState.title}, ${seasonTitle}` : modalState.title,
+      body,
+      () => {
+        modalState.onRequested();
+        if (submission.dismiss()) router.back();
+      },
+    );
+    // A refusal leaves the sheet open, to try again.
+    submission.finish();
+  }, [
+    submission,
+    modalState,
+    requestOverrides,
+    defaultProfile,
+    defaultFolder,
+    defaultTags,
+    defaultService,
+    defaultServiceDetails,
+    requestMedia,
+    router,
+    t,
+  ]);
+
+  if (!modalState) {
+    return null;
+  }
+
+  const isDataLoaded =
+    defaultService && defaultServiceDetails && (!forOthers || users);
+
+  return (
+    <Animated.View style={[styles.overlay, { opacity: overlayOpacity }]}>
+      <Animated.View
+        style={[
+          styles.sheetContainer,
+          { transform: [{ translateY: sheetTranslateY }] },
+        ]}
+      >
+        <BlurView intensity={80} tint='dark' style={styles.blurContainer}>
+          <TVFocusGuideView
+            autoFocus
+            trapFocusUp
+            trapFocusDown
+            trapFocusLeft
+            trapFocusRight
+            style={styles.content}
+          >
+            <Text style={[styles.heading, { fontSize: typography.heading }]}>
+              {t("seerr.advanced")}
+            </Text>
+            <Text style={[styles.subtitle, { fontSize: typography.callout }]}>
+              {modalState.title}
+            </Text>
+
+            {isDataLoaded && isReady ? (
+              <ScrollView
+                style={styles.scrollView}
+                showsVerticalScrollIndicator={false}
+              >
+                <View style={styles.optionsContainer}>
+                  <TVRequestOptionRow
+                    label={t("seerr.quality_profile")}
+                    value={selectedProfileName}
+                    onPress={() => setActiveSelector("profile")}
+                    hasTVPreferredFocus
+                  />
+                  <TVRequestOptionRow
+                    label={t("seerr.root_folder")}
+                    value={selectedFolderName}
+                    onPress={() => setActiveSelector("folder")}
+                  />
+                  {forOthers && (
+                    <TVRequestOptionRow
+                      label={t("seerr.request_as")}
+                      value={selectedUserName}
+                      onPress={() => setActiveSelector("user")}
+                    />
+                  )}
+
+                  {tagItems.length > 0 && (
+                    <TVToggleOptionRow
+                      label={t("seerr.tags")}
+                      items={tagItems}
+                      onToggle={handleTagToggle}
+                    />
+                  )}
+                </View>
+              </ScrollView>
+            ) : (
+              <View style={styles.loadingContainer}>
+                <Text style={styles.loadingText}>{t("common.loading")}</Text>
+              </View>
+            )}
+
+            {isReady && (
+              <View style={styles.buttonContainer}>
+                <TVButton
+                  onPress={handleRequest}
+                  variant='secondary'
+                  disabled={!isDataLoaded}
+                >
+                  <Ionicons
+                    name='add'
+                    size={22}
+                    color='#FFFFFF'
+                    style={{ marginRight: 8 }}
+                  />
+                  <Text
+                    style={[
+                      styles.buttonText,
+                      { fontSize: typography.callout },
+                    ]}
+                  >
+                    {t("seerr.request_button")}
+                  </Text>
+                </TVButton>
+              </View>
+            )}
+          </TVFocusGuideView>
+        </BlurView>
+      </Animated.View>
+
+      {/* Sub-selectors */}
+      <TVOptionSelector
+        visible={activeSelector === "profile"}
+        title={t("seerr.quality_profile")}
+        options={qualityProfileOptions}
+        onSelect={handleProfileChange}
+        onClose={() => setActiveSelector(null)}
+        cancelLabel={t("seerr.cancel")}
+      />
+      <TVOptionSelector
+        visible={activeSelector === "folder"}
+        title={t("seerr.root_folder")}
+        options={rootFolderOptions}
+        onSelect={handleFolderChange}
+        onClose={() => setActiveSelector(null)}
+        cancelLabel={t("seerr.cancel")}
+        cardWidth={280}
+      />
+      <TVOptionSelector
+        visible={activeSelector === "user"}
+        title={t("seerr.request_as")}
+        options={userOptions}
+        onSelect={handleUserChange}
+        onClose={() => setActiveSelector(null)}
+        cancelLabel={t("seerr.cancel")}
+      />
+    </Animated.View>
+  );
+}
+
+const styles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+    justifyContent: "flex-end",
+  },
+  sheetContainer: {
+    width: "100%",
+  },
+  blurContainer: {
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    overflow: "hidden",
+  },
+  content: {
+    paddingTop: 24,
+    paddingBottom: 50,
+    paddingHorizontal: 44,
+    overflow: "visible",
+  },
+  heading: {
+    fontWeight: "bold",
+    color: "#FFFFFF",
+    marginBottom: 8,
+  },
+  subtitle: {
+    color: "rgba(255,255,255,0.6)",
+    marginBottom: 24,
+  },
+  scrollView: {
+    maxHeight: 320,
+    overflow: "visible",
+  },
+  optionsContainer: {
+    gap: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  loadingContainer: {
+    height: 200,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  loadingText: {
+    color: "rgba(255,255,255,0.5)",
+  },
+  buttonContainer: {
+    marginTop: 24,
+  },
+  buttonText: {
+    fontWeight: "bold",
+    color: "#FFFFFF",
+  },
+});

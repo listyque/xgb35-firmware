@@ -1,0 +1,513 @@
+// Must stay above every other import: it runs the storage migrations.
+import "@/utils/bootstrap";
+import "@/augmentations";
+import { ActionSheetProvider } from "@expo/react-native-action-sheet";
+import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
+import NetInfo from "@react-native-community/netinfo";
+import { createSyncStoragePersister } from "@tanstack/query-sync-storage-persister";
+import {
+  MutationCache,
+  onlineManager,
+  QueryCache,
+  QueryClient,
+} from "@tanstack/react-query";
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
+import * as BackgroundTask from "expo-background-task";
+import { Image } from "expo-image";
+import { Platform } from "react-native";
+import { GlobalModal } from "@/components/GlobalModal";
+import { OfflineProgressSync } from "@/components/OfflineProgressSync";
+import { PendingAccountSaveModal } from "@/components/PendingAccountSaveModal";
+import { SeerrAutoLogin } from "@/components/seerr/SeerrAutoLogin";
+import { SyncPlayPlaybackBridge } from "@/components/syncplay/SyncPlayPlaybackBridge";
+import { ActionSheetInsets } from "@/hooks/useActionSheet";
+import { enableTVMenuKeyInterception } from "@/hooks/useTVBackHandler";
+import i18n from "@/i18n";
+import { DownloadProvider } from "@/providers/DownloadProvider";
+import { GlobalModalProvider } from "@/providers/GlobalModalProvider";
+import { InactivityProvider } from "@/providers/InactivityProvider";
+import { IntroSheetProvider } from "@/providers/IntroSheetProvider";
+import { apiAtom, JellyfinProvider } from "@/providers/JellyfinProvider";
+import { MusicPlayerProvider } from "@/providers/MusicPlayerProvider";
+import { NativePlayerProvider } from "@/providers/NativePlayerProvider";
+import { NetworkStatusProvider } from "@/providers/NetworkStatusProvider";
+import { PlaySettingsProvider } from "@/providers/PlaySettingsProvider";
+import { ServerUrlProvider } from "@/providers/ServerUrlProvider";
+import { SyncPlayProvider } from "@/providers/SyncPlayProvider";
+import { WebSocketProvider } from "@/providers/WebSocketProvider";
+import { WifiSsidProvider } from "@/providers/WifiSsidProvider";
+import { useSettings } from "@/utils/atoms/settings";
+import {
+  BACKGROUND_FETCH_TASK,
+  BACKGROUND_FETCH_TASK_SESSIONS,
+} from "@/utils/background-tasks";
+import { LogProvider } from "@/utils/log";
+import { storage } from "@/utils/mmkv";
+import { responseRoute } from "@/utils/notificationRoute";
+import {
+  queryDehydrateOptions,
+  withoutPersistedMutations,
+  withoutRedundantSaves,
+} from "@/utils/queryPersistence";
+import { shouldRetryQuery } from "@/utils/queryRetry";
+import { reportDataError } from "@/utils/reportDataError";
+
+const Notifications = !Platform.isTV ? require("expo-notifications") : null;
+const JellyfinCastStopReporter = Platform.isTV
+  ? null
+  : require("@/components/JellyfinCastStopReporter").JellyfinCastStopReporter;
+
+import { getSessionApi } from "@jellyfin/sdk/lib/utils/api/session-api";
+import { getLocales } from "expo-localization";
+import { DarkTheme, Stack, ThemeProvider, useSegments } from "expo-router";
+import * as SplashScreen from "expo-splash-screen";
+import * as TaskManager from "expo-task-manager";
+import { Provider as JotaiProvider, useAtomValue } from "jotai";
+import { useEffect } from "react";
+import { I18nextProvider } from "react-i18next";
+import { Appearance, LogBox } from "react-native";
+import { SystemBars } from "react-native-edge-to-edge";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+
+// Suppress harmless tvOS warning from react-native-gesture-handler
+if (Platform.isTV) {
+  LogBox.ignoreLogs(["HoverGestureHandler is not supported on tvOS"]);
+}
+
+import * as Sentry from "@sentry/react-native";
+import { useAppLanguage } from "@/hooks/useAppLanguage";
+import useRouter from "@/hooks/useAppRouter";
+import { useNativePlayerLogBridge } from "@/hooks/useNativePlayerLogBridge";
+import { useNotificationActions } from "@/hooks/useNotificationActions";
+import { useNotificationRegistration } from "@/hooks/useNotificationRegistration";
+import { useNotificationSettingsLink } from "@/hooks/useNotificationSettingsLink";
+import { usePushRegistration } from "@/hooks/usePushRegistration";
+import { effectiveSettingsAtom, settingsAtom } from "@/utils/atoms/settings";
+import {
+  applySentryConsent,
+  initializeSentryIfConsented,
+} from "@/utils/sentry";
+import { store as jotaiStore, store } from "@/utils/store";
+import "react-native-reanimated";
+import {
+  configureReanimatedLogger,
+  ReanimatedLogLevel,
+} from "react-native-reanimated";
+import { Toaster } from "sonner-native";
+
+// Back from a deep link lands on the tabs. Expo Router 58 dropped the
+// navigator's initialRouteName prop in favour of the layout's anchor.
+export const unstable_settings = { anchor: "(auth)/(tabs)" };
+
+// Disable strict mode warnings for reading shared values during render
+configureReanimatedLogger({
+  level: ReanimatedLogLevel.warn,
+  strict: false,
+});
+
+// Crash reporting is on by default; this is a no-op if the user opted out
+// (or a server admin locked it off). After startup, consent tracks the
+// effective settings, so the switch, plugin-pushed defaults, and admin locks
+// all take effect immediately.
+initializeSentryIfConsented();
+jotaiStore.sub(effectiveSettingsAtom, () => {
+  // Ignore changes until the persisted settings hydrate; before that the
+  // effective value is just defaults and would override a stored opt-out.
+  if (jotaiStore.get(settingsAtom) === null) return;
+  applySentryConsent(
+    jotaiStore.get(effectiveSettingsAtom).sentryEnabled !== false,
+  );
+});
+
+if (!Platform.isTV) {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowBanner: true,
+      shouldShowList: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+    }),
+  });
+}
+
+// Keep the splash screen visible while we fetch resources
+SplashScreen.preventAutoHideAsync();
+
+// Set the animation options. This is optional.
+SplashScreen.setOptions({
+  duration: 500,
+  fade: true,
+});
+
+// Cap expo-image's in-memory cache. Default is unbounded (maxMemoryCost=0),
+// which on a 2GB Android TV box leads to ~200MB of decoded backdrops/posters
+// pinned in RAM after browsing. Caps are intentionally tighter on TV (which
+// has less RAM and runs alongside libmpv/MediaCodec) than on mobile.
+// Cost is measured in bytes of decoded bitmap (ARGB8888 = 4 bytes/pixel).
+try {
+  Image.configureCache({
+    maxMemoryCost: Platform.isTV
+      ? 8 * 1024 * 1024 // ~8 MB on TV
+      : 128 * 1024 * 1024, // ~128 MB on mobile
+    maxDiskSize: 200 * 1024 * 1024, // 200 MB disk cache on all platforms
+  });
+} catch {
+  // configureCache is a no-op on some platforms/versions; safe to ignore.
+}
+
+/**
+ * Opens what a notification is about: one tapped while the app runs, and the one that opened
+ * it. A button opens nothing.
+ */
+function useNotificationObserver() {
+  const router = useRouter();
+
+  useEffect(() => {
+    if (Platform.isTV) return;
+
+    let isMounted = true;
+
+    // The notification the app was opened by, which is the one case the listener below
+    // never sees: it is registered once the app is running, and by then the tap that
+    // started it has been and gone. It read only a route sent ready made, which the
+    // plugin does not send, so opening a notification from a closed app landed on the
+    // home screen.
+    Notifications.getLastNotificationResponseAsync().then(
+      (response: { notification: any; actionIdentifier: string } | null) => {
+        if (!isMounted) return;
+        // A button is carried out by useNotificationActions, and opens nothing.
+        const route = responseRoute(
+          response,
+          Notifications.DEFAULT_ACTION_IDENTIFIER,
+        );
+        if (route) {
+          router.push(route as never);
+        }
+      },
+    );
+
+    return () => {
+      isMounted = false;
+    };
+  }, [router]);
+}
+
+if (!Platform.isTV) {
+  TaskManager.defineTask(BACKGROUND_FETCH_TASK_SESSIONS, async () => {
+    console.log("TaskManager ~ sessions trigger");
+
+    const api = store.get(apiAtom);
+    if (api === null || api === undefined) return;
+
+    const response = await getSessionApi(api).getSessions({
+      activeWithinSeconds: 360,
+    });
+
+    const result = response.data.filter((s) => s.NowPlayingItem);
+    Notifications.setBadgeCountAsync(result.length);
+
+    return BackgroundTask.BackgroundTaskResult.Success;
+  });
+
+  TaskManager.defineTask(BACKGROUND_FETCH_TASK, async () => {
+    console.log("TaskManager ~ trigger");
+    // Background fetch task placeholder - currently unused
+    return BackgroundTask.BackgroundTaskResult.Success;
+  });
+}
+
+function RootLayout() {
+  Appearance.setColorScheme("dark");
+
+  return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <JotaiProvider store={jotaiStore}>
+        <ActionSheetProvider>
+          <I18nextProvider i18n={i18n}>
+            {/* Here and not beside it: ActionSheetProvider takes one child. */}
+            <ActionSheetInsets />
+            <Layout />
+          </I18nextProvider>
+        </ActionSheetProvider>
+      </JotaiProvider>
+    </GestureHandlerRootView>
+  );
+}
+
+// Sentry.wrap is inert while the SDK is not initialized (crash reporting off).
+export default Sentry.wrap(RootLayout);
+
+// Render-phase crashes anywhere in the tree get a retry screen instead of a
+// blank app, and the error reaches Sentry with its component stack.
+export { RouteErrorBoundary as ErrorBoundary } from "@/components/RouteErrorBoundary";
+
+// Set up online manager for network-aware query behavior
+onlineManager.setEventListener((setOnline) => {
+  return NetInfo.addEventListener((state) => {
+    setOnline(!!state.isConnected);
+  });
+});
+
+// Every React Query failure funnels through reportDataError instead of
+// needing per-call handlers; what it skips and why is in
+// utils/reportDataError.ts.
+const queryClient = new QueryClient({
+  queryCache: new QueryCache({
+    onError: (error, query) => reportDataError("query", query.queryKey, error),
+  }),
+  mutationCache: new MutationCache({
+    onError: (error, _variables, _context, mutation) =>
+      reportDataError("mutation", mutation.options.mutationKey, error),
+  }),
+  defaultOptions: {
+    queries: {
+      staleTime: 0, // Always stale - triggers background refetch on mount
+      gcTime: 1000 * 60 * 60 * 24, // 24 hours - keep in cache for offline
+      networkMode: "offlineFirst", // Return cache first, refetch if online
+      refetchOnMount: true, // Refetch when component mounts
+      refetchOnReconnect: true, // Refetch when network reconnects
+      refetchOnWindowFocus: false, // Not needed for mobile
+      retry: shouldRetryQuery, // Never offline, nor for a stale id
+    },
+    mutations: {
+      networkMode: "online", // Only run mutations when online
+    },
+  },
+});
+
+// Create MMKV-based persister for offline support. What it writes and what it
+// restores is in utils/queryPersistence.ts.
+const mmkvPersister = withoutPersistedMutations(
+  withoutRedundantSaves(
+    createSyncStoragePersister({
+      storage: {
+        getItem: (key) => storage.getString(key) ?? null,
+        setItem: (key, value) => storage.set(key, value),
+        removeItem: (key) => storage.remove(key),
+      },
+    }),
+  ),
+);
+
+function Layout() {
+  const { settings } = useSettings();
+  const settingsLoaded = useAtomValue(settingsAtom) !== null;
+  const _segments = useSegments();
+
+  // Enable TV menu key interception so React Native handles it instead of tvOS
+  useEffect(() => {
+    enableTVMenuKeyInterception();
+  }, []);
+
+  // What the app is shown in, and what the plugin writes this device's
+  // notifications in.
+  const language =
+    settings?.preferedLanguage ?? getLocales()[0].languageCode ?? "en";
+
+  useAppLanguage(language, settingsLoaded, queryClient, Notifications);
+
+  useNotificationObserver();
+  useNotificationActions(queryClient);
+  useNotificationSettingsLink();
+  useNativePlayerLogBridge();
+
+  const expoPushToken = useNotificationRegistration();
+
+  usePushRegistration(expoPushToken?.data, language);
+
+  return (
+    <PersistQueryClientProvider
+      client={queryClient}
+      persistOptions={{
+        persister: mmkvPersister,
+        maxAge: 1000 * 60 * 60 * 24, // 24 hours max cache age
+        dehydrateOptions: queryDehydrateOptions,
+      }}
+    >
+      <JellyfinProvider>
+        <InactivityProvider>
+          <WifiSsidProvider>
+            <ServerUrlProvider>
+              <NetworkStatusProvider>
+                <PlaySettingsProvider>
+                  <LogProvider>
+                    <WebSocketProvider>
+                      <SyncPlayProvider>
+                        <DownloadProvider>
+                          <NativePlayerProvider>
+                            <SyncPlayPlaybackBridge />
+                            <MusicPlayerProvider>
+                              <GlobalModalProvider>
+                                <BottomSheetModalProvider>
+                                  <IntroSheetProvider>
+                                    <ThemeProvider value={DarkTheme}>
+                                      <SystemBars
+                                        style='light'
+                                        hidden={false}
+                                      />
+                                      {JellyfinCastStopReporter && (
+                                        <JellyfinCastStopReporter />
+                                      )}
+                                      <Stack>
+                                        <Stack.Screen
+                                          name='(auth)/(tabs)'
+                                          options={{
+                                            headerShown: false,
+                                            title: "",
+                                            header: () => null,
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/player'
+                                          options={{
+                                            headerShown: false,
+                                            title: "",
+                                            header: () => null,
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/now-playing'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "modal",
+                                            gestureEnabled: true,
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='login'
+                                          options={{
+                                            headerShown: true,
+                                            title: "",
+                                            headerTransparent:
+                                              Platform.OS === "ios",
+                                          }}
+                                        />
+                                        <Stack.Screen name='+not-found' />
+                                        <Stack.Screen
+                                          name='(auth)/tv-syncplay-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-option-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-library-sheet-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-subtitle-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-request-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-season-select-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-issue-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-series-season-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='tv-account-action-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='tv-account-select-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                        <Stack.Screen
+                                          name='(auth)/tv-user-switch-modal'
+                                          options={{
+                                            headerShown: false,
+                                            presentation: "transparentModal",
+                                            animation: "fade",
+                                          }}
+                                        />
+                                      </Stack>
+                                      <Toaster
+                                        duration={4000}
+                                        toastOptions={{
+                                          style: {
+                                            backgroundColor: "#262626",
+                                            borderColor: "#363639",
+                                            borderWidth: 1,
+                                          },
+                                          titleStyle: {
+                                            color: "white",
+                                          },
+                                        }}
+                                        closeButton
+                                      />
+                                      {!Platform.isTV && <GlobalModal />}
+                                      {!Platform.isTV && (
+                                        <PendingAccountSaveModal />
+                                      )}
+                                      <SeerrAutoLogin />
+                                      <OfflineProgressSync />
+                                    </ThemeProvider>
+                                  </IntroSheetProvider>
+                                </BottomSheetModalProvider>
+                              </GlobalModalProvider>
+                            </MusicPlayerProvider>
+                          </NativePlayerProvider>
+                        </DownloadProvider>
+                      </SyncPlayProvider>
+                    </WebSocketProvider>
+                  </LogProvider>
+                </PlaySettingsProvider>
+              </NetworkStatusProvider>
+            </ServerUrlProvider>
+          </WifiSsidProvider>
+        </InactivityProvider>
+      </JellyfinProvider>
+    </PersistQueryClientProvider>
+  );
+}

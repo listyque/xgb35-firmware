@@ -1,0 +1,428 @@
+package expo.modules.mpvplayer.nativeplayer.ui.tv
+
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.ClosedCaption
+import androidx.compose.material.icons.filled.FastForward
+import androidx.compose.material.icons.filled.FastRewind
+import androidx.compose.material.icons.filled.FormatListBulleted
+import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
+// tv-material3's Icon, not compose.material3's: the TV IconButton feeds its
+// content color through the TV library's LocalContentColor, which the mobile
+// Icon never reads (it defaults to black).
+import androidx.tv.material3.Icon
+import androidx.tv.material3.LocalContentColor
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.BorderStroke
+import androidx.tv.material3.Border
+import androidx.tv.material3.Button
+import androidx.tv.material3.ButtonDefaults
+import androidx.tv.material3.IconButton
+import androidx.tv.material3.IconButtonDefaults
+import androidx.tv.material3.Text
+import expo.modules.mpvplayer.nativeplayer.PlayerViewModel
+import expo.modules.mpvplayer.nativeplayer.TvMenuScreen
+import expo.modules.mpvplayer.nativeplayer.ui.SeekIcon
+import kotlinx.coroutines.delay
+
+enum class TvControl {
+    PREV_EPISODE,
+    SKIP_BACK,
+    PREV_CHAPTER,
+    PLAY_PAUSE,
+    NEXT_CHAPTER,
+    SKIP_FORWARD,
+    NEXT_EPISODE,
+    MUTE,
+    SKIP_SEGMENT,
+    EPISODES,
+    CHAPTERS,
+    QUALITY,
+    AUDIO,
+    SUBTITLES,
+    SPEED,
+    SYNCPLAY_QUEUE,
+    MORE
+}
+
+@Composable
+fun TvControlsRow(
+    viewModel: PlayerViewModel,
+    lastFocused: TvControl?,
+    onControlFocused: (TvControl) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isEpisode = viewModel.metadata?.isEpisode == true && !viewModel.syncPlayActive
+    val showPrevious = isEpisode || viewModel.syncPlay?.hasPrevious == true
+    val showNext = isEpisode || viewModel.syncPlay?.hasNext == true
+    val hasChapters = viewModel.chapters.isNotEmpty()
+    val hasEpisodes = viewModel.episodeList.isNotEmpty() && !viewModel.syncPlayActive
+    val hasQuality = viewModel.qualityMenu.isNotEmpty()
+    val hasAudio = viewModel.audioMenu.isNotEmpty()
+    val hasSubtitles = viewModel.subtitleMenu.isNotEmpty() || viewModel.uiOptions.subtitleSearchEnabled
+    val activeSegment = viewModel.activeSegment
+
+    fun isAvailable(control: TvControl): Boolean = when (control) {
+        TvControl.PREV_EPISODE -> showPrevious
+        TvControl.NEXT_EPISODE -> showNext
+        TvControl.SYNCPLAY_QUEUE -> viewModel.syncPlayActive
+        TvControl.SPEED -> !viewModel.syncPlayActive
+        TvControl.PREV_CHAPTER, TvControl.NEXT_CHAPTER, TvControl.CHAPTERS -> hasChapters
+        TvControl.EPISODES -> hasEpisodes
+        TvControl.QUALITY -> hasQuality
+        TvControl.AUDIO -> hasAudio
+        TvControl.SUBTITLES -> hasSubtitles
+        TvControl.SKIP_SEGMENT -> activeSegment != null
+        TvControl.MUTE, TvControl.SKIP_BACK, TvControl.SKIP_FORWARD, TvControl.PLAY_PAUSE,
+        TvControl.MORE -> true
+    }
+
+    val defaultFocusTarget = if (lastFocused != null && isAvailable(lastFocused)) {
+        lastFocused
+    } else {
+        TvControl.PLAY_PAUSE
+    }
+
+    val focusRequesters = remember {
+        TvControl.entries.associateWith { FocusRequester() }
+    }
+
+    // Fires on mount (tick 0) and again whenever the view model asks for a
+    // focus restore — e.g. after a focused overlay/button unmounted and left
+    // the Compose tree without any focused node.
+    LaunchedEffect(viewModel.tvControlsFocusRestoreTick) {
+        delay(40L)
+        runCatching {
+            focusRequesters[defaultFocusTarget]?.requestFocus()
+        }
+    }
+
+    // The skip button can vanish while focused (clicked, or the segment
+    // expired under the user) — put focus back on a control that exists.
+    LaunchedEffect(activeSegment) {
+        if (activeSegment == null && lastFocused == TvControl.SKIP_SEGMENT) {
+            viewModel.restoreTvControlsFocus()
+        }
+    }
+
+    // Previous and Next follow the group's queue, the queue button and the
+    // speed button follow membership. One of them unmounting under the focus
+    // (Next pressed on the second to last item) leaves the remote dead.
+    LaunchedEffect(showPrevious, showNext, viewModel.syncPlayActive) {
+        if (viewModel.controlsVisible && lastFocused != null && !isAvailable(lastFocused)) {
+            viewModel.restoreTvControlsFocus()
+        }
+    }
+
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // --- Left Transport Cluster ---
+        if (showPrevious) {
+            TvIconButton(
+                control = TvControl.PREV_EPISODE,
+                icon = Icons.Filled.SkipPrevious,
+                contentDescription = if (viewModel.syncPlayActive) viewModel.syncStr("previous", "Previous") else "Previous Episode",
+                focusRequester = focusRequesters.getValue(TvControl.PREV_EPISODE),
+                onFocused = onControlFocused,
+                onClick = { viewModel.playPreviousEpisode() }
+            )
+        }
+
+        TvIconButton(
+            control = TvControl.SKIP_BACK,
+            focusRequester = focusRequesters.getValue(TvControl.SKIP_BACK),
+            onFocused = onControlFocused,
+            onClick = { viewModel.seekBy(-viewModel.uiOptions.seekBackwardSec) }
+        ) {
+            SeekIcon(
+                forward = false,
+                seconds = viewModel.uiOptions.seekBackwardSec,
+                tint = LocalContentColor.current,
+                contentDescription = "Skip Back",
+                modifier = Modifier.size(TvMetrics.ICON_SIZE)
+            )
+        }
+
+        if (hasChapters) {
+            TvIconButton(
+                control = TvControl.PREV_CHAPTER,
+                icon = Icons.Filled.FastRewind,
+                contentDescription = "Previous Chapter",
+                focusRequester = focusRequesters.getValue(TvControl.PREV_CHAPTER),
+                onFocused = onControlFocused,
+                onClick = { viewModel.goToPreviousChapter() }
+            )
+        }
+
+        TvIconButton(
+            control = TvControl.PLAY_PAUSE,
+            icon = if (viewModel.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+            contentDescription = if (viewModel.isPlaying) viewModel.syncStr("pause", "Pause") else viewModel.syncStr("play", "Play"),
+            focusRequester = focusRequesters.getValue(TvControl.PLAY_PAUSE),
+            onFocused = onControlFocused,
+            onClick = { viewModel.togglePlayPause() }
+        )
+
+        if (hasChapters) {
+            TvIconButton(
+                control = TvControl.NEXT_CHAPTER,
+                icon = Icons.Filled.FastForward,
+                contentDescription = "Next Chapter",
+                focusRequester = focusRequesters.getValue(TvControl.NEXT_CHAPTER),
+                onFocused = onControlFocused,
+                onClick = { viewModel.goToNextChapter() }
+            )
+        }
+
+        TvIconButton(
+            control = TvControl.SKIP_FORWARD,
+            focusRequester = focusRequesters.getValue(TvControl.SKIP_FORWARD),
+            onFocused = onControlFocused,
+            onClick = { viewModel.seekBy(viewModel.uiOptions.seekForwardSec) }
+        ) {
+            SeekIcon(
+                forward = true,
+                seconds = viewModel.uiOptions.seekForwardSec,
+                tint = LocalContentColor.current,
+                contentDescription = "Skip Forward",
+                modifier = Modifier.size(TvMetrics.ICON_SIZE)
+            )
+        }
+
+        if (showNext) {
+            TvIconButton(
+                control = TvControl.NEXT_EPISODE,
+                icon = Icons.Filled.SkipNext,
+                contentDescription = if (viewModel.syncPlayActive) viewModel.syncStr("next", "Next") else "Next Episode",
+                focusRequester = focusRequesters.getValue(TvControl.NEXT_EPISODE),
+                onFocused = onControlFocused,
+                onClick = { viewModel.playNextEpisode() }
+            )
+        }
+
+        // Grouped with the transport controls rather than the track selectors:
+        // it acts on playback, and the audio-track button on the right already
+        // carries a speaker icon. On a TV the output volume belongs to the
+        // display or the receiver over HDMI-CEC, so the app never sees it —
+        // this mutes mpv itself, which is also what drives the automatic
+        // subtitles.
+        TvIconButton(
+            control = TvControl.MUTE,
+            icon = if (viewModel.isMuted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+            contentDescription = if (viewModel.isMuted) "Unmute" else "Mute",
+            focusRequester = focusRequesters.getValue(TvControl.MUTE),
+            onFocused = onControlFocused,
+            onClick = { viewModel.toggleMute() }
+        )
+
+        if (activeSegment != null) {
+            val segmentLabel = viewModel.skipLabel(activeSegment.type)
+            Button(
+                onClick = { viewModel.skipActiveSegment() },
+                modifier = Modifier
+                    .focusRequester(focusRequesters.getValue(TvControl.SKIP_SEGMENT))
+                    .onFocusChanged {
+                        if (it.isFocused) {
+                            onControlFocused(TvControl.SKIP_SEGMENT)
+                            viewModel.scheduleAutoHide()
+                        }
+                    },
+                colors = ButtonDefaults.colors(
+                    containerColor = TvPalette.SurfaceGlass,
+                    focusedContainerColor = TvPalette.FocusFill,
+                    contentColor = TvPalette.OnSurface,
+                    focusedContentColor = TvPalette.OnFocus
+                ),
+                border = ButtonDefaults.border(
+                    border = Border(
+                        border = BorderStroke(1.dp, TvPalette.Hairline)
+                    )
+                )
+            ) {
+                Text(
+                    text = segmentLabel,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        // --- Right Options Cluster ---
+        if (viewModel.syncPlayActive) {
+            TvIconButton(
+                control = TvControl.SYNCPLAY_QUEUE,
+                icon = Icons.Filled.FormatListBulleted,
+                contentDescription = viewModel.syncStr("queue", "Queue"),
+                focusRequester = focusRequesters.getValue(TvControl.SYNCPLAY_QUEUE),
+                onFocused = onControlFocused,
+                onClick = { viewModel.openSyncPlayQueue() }
+            )
+        }
+        if (hasEpisodes) {
+            TvIconButton(
+                control = TvControl.EPISODES,
+                icon = Icons.Filled.VideoLibrary,
+                contentDescription = "Episodes",
+                focusRequester = focusRequesters.getValue(TvControl.EPISODES),
+                onFocused = onControlFocused,
+                onClick = { viewModel.showEpisodeList = true }
+            )
+        }
+
+        if (hasChapters) {
+            TvIconButton(
+                control = TvControl.CHAPTERS,
+                icon = Icons.Filled.Bookmark,
+                contentDescription = "Chapters",
+                focusRequester = focusRequesters.getValue(TvControl.CHAPTERS),
+                onFocused = onControlFocused,
+                onClick = { viewModel.openTvMenu(TvMenuScreen.CHAPTERS) }
+            )
+        }
+
+        if (hasQuality) {
+            TvIconButton(
+                control = TvControl.QUALITY,
+                icon = Icons.Filled.Speed,
+                contentDescription = "Quality",
+                focusRequester = focusRequesters.getValue(TvControl.QUALITY),
+                onFocused = onControlFocused,
+                onClick = { viewModel.openTvMenu(TvMenuScreen.QUALITY) }
+            )
+        }
+
+        if (hasAudio) {
+            TvIconButton(
+                control = TvControl.AUDIO,
+                icon = Icons.Filled.VolumeUp,
+                contentDescription = "Audio",
+                focusRequester = focusRequesters.getValue(TvControl.AUDIO),
+                onFocused = onControlFocused,
+                onClick = { viewModel.openTvMenu(TvMenuScreen.AUDIO_ROOT) }
+            )
+        }
+
+        if (hasSubtitles) {
+            TvIconButton(
+                control = TvControl.SUBTITLES,
+                icon = Icons.Filled.ClosedCaption,
+                contentDescription = "Subtitles",
+                focusRequester = focusRequesters.getValue(TvControl.SUBTITLES),
+                onFocused = onControlFocused,
+                onClick = { viewModel.openTvMenu(TvMenuScreen.SUBTITLES_ROOT) }
+            )
+        }
+
+        if (!viewModel.syncPlayActive) TvIconButton(
+            control = TvControl.SPEED,
+            icon = Icons.Filled.Timer,
+            contentDescription = "Speed",
+            focusRequester = focusRequesters.getValue(TvControl.SPEED),
+            onFocused = onControlFocused,
+            onClick = { viewModel.openTvMenu(TvMenuScreen.SPEED) }
+        )
+
+        TvIconButton(
+            control = TvControl.MORE,
+            icon = Icons.Filled.MoreHoriz,
+            contentDescription = "More",
+            focusRequester = focusRequesters.getValue(TvControl.MORE),
+            onFocused = onControlFocused,
+            onClick = { viewModel.openTvMenu(TvMenuScreen.MORE) }
+        )
+    }
+}
+
+@Composable
+private fun TvIconButton(
+    control: TvControl,
+    icon: ImageVector,
+    contentDescription: String,
+    focusRequester: FocusRequester,
+    onFocused: (TvControl) -> Unit,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    TvIconButton(control, focusRequester, onFocused, onClick, modifier) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(TvMetrics.ICON_SIZE)
+        )
+    }
+}
+
+/** The round control with any glyph; the content reads its focus colour from LocalContentColor. */
+@Composable
+private fun TvIconButton(
+    control: TvControl,
+    focusRequester: FocusRequester,
+    onFocused: (TvControl) -> Unit,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    var isFocused by remember { mutableStateOf(false) }
+    IconButton(
+        onClick = onClick,
+        modifier = modifier
+            .size(TvMetrics.CONTROL_SIZE)
+            .focusRequester(focusRequester)
+            .onFocusChanged {
+                isFocused = it.isFocused
+                if (it.isFocused) {
+                    onFocused(control)
+                }
+            }
+            // Hairline only while unfocused; the focused fill is solid white.
+            .then(
+                if (isFocused) Modifier
+                else Modifier.border(1.dp, TvPalette.Hairline, CircleShape)
+            ),
+        colors = IconButtonDefaults.colors(
+            containerColor = TvPalette.SurfaceGlass,
+            focusedContainerColor = TvPalette.FocusFill,
+            contentColor = TvPalette.OnSurface,
+            focusedContentColor = TvPalette.OnFocus
+        )
+    ) {
+        content()
+    }
+}

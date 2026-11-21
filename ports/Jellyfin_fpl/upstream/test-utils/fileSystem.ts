@@ -1,0 +1,141 @@
+const existing = new Set<string>();
+const deleted: string[] = [];
+const undeletable = new Set<string>();
+const downloaded: { url: string; destination: string }[] = [];
+
+const withoutTrailingSlash = (uri: string) => uri.replace(/\/+$/, "");
+
+class FakeEntry {
+  /** The entry's location with no trailing slash, which is how the store keys it. */
+  protected readonly location: string;
+
+  constructor(...parts: (string | FakeEntry)[]) {
+    this.location = parts
+      .map((part) =>
+        withoutTrailingSlash(typeof part === "string" ? part : part.uri),
+      )
+      .join("/");
+  }
+
+  get uri() {
+    return this.location;
+  }
+
+  get exists() {
+    return existing.has(this.location);
+  }
+
+  delete() {
+    if (undeletable.has(this.location)) throw new Error("EPERM");
+    existing.delete(this.location);
+    deleted.push(this.location);
+  }
+}
+
+class FakeFile extends FakeEntry {
+  /** Records the download and puts the file on the fake disk, without fetching anything. */
+  static async downloadFileAsync(url: string, destination: FakeFile) {
+    downloaded.push({ url, destination: destination.uri });
+    existing.add(destination.uri);
+    return destination;
+  }
+
+  /** Re-keys the entry, like the real move: the old path stops existing. */
+  move(destination: FakeFile | FakeDirectory | string) {
+    const to = withoutTrailingSlash(
+      typeof destination === "string" ? destination : destination.uri,
+    );
+    existing.delete(this.location);
+    existing.add(to);
+  }
+
+  /** Sizes are not modelled: every file reports 0 bytes. */
+  info() {
+    return { exists: this.exists, size: 0 };
+  }
+}
+
+class FakeDirectory extends FakeEntry {
+  // Like the real one, a directory's uri ends in a slash.
+  get uri() {
+    return `${this.location}/`;
+  }
+
+  create() {
+    existing.add(this.location);
+  }
+
+  /** The entries directly inside, every one as a file: nothing here tells the two apart. */
+  list() {
+    const prefix = `${this.location}/`;
+    return [...existing]
+      .filter(
+        (path) =>
+          path.startsWith(prefix) && !path.slice(prefix.length).includes("/"),
+      )
+      .map((path) => new FakeFile(path));
+  }
+
+  delete() {
+    super.delete();
+    for (const path of existing) {
+      if (path.startsWith(`${this.location}/`)) existing.delete(path);
+    }
+  }
+}
+
+/** Where `Paths.document` points in a spec. */
+export const DOCUMENTS = "file:///documents";
+/** Where `Paths.cache` points in a spec. */
+export const CACHE = "file:///cache";
+/** The size of the volume Documents is on, as `Paths.totalDiskSpace` reads it in a spec. */
+export const DISK_TOTAL = 64_000_000_000;
+/** The space left on it, as `Paths.availableDiskSpace` reads it in a spec. */
+export const DISK_AVAILABLE = 10_000_000_000;
+
+/**
+ * An expo-file-system double for specs that delete or download files: a path exists once a spec
+ * adds it, or something downloads to it, and until something deletes it. Every delete and every
+ * download is recorded. `moduleNameMapper` wires it for every spec through
+ * `test-utils/fileSystemModule.ts`; `fakeFiles` seeds and reads back the fake disk.
+ *
+ * Only what the app's delete and download paths call is implemented: the `File` and `Directory`
+ * constructors, `uri`, `exists`, `delete()`, `File.downloadFileAsync()`, `File.move()`,
+ * `File.info()` for the completion handler, and `create()` and `list()` on a directory.
+ */
+export const fileSystemModule = {
+  File: FakeFile,
+  Directory: FakeDirectory,
+  Paths: {
+    get document() {
+      return new FakeDirectory(DOCUMENTS);
+    },
+    get cache() {
+      return new FakeDirectory(CACHE);
+    },
+    totalDiskSpace: DISK_TOTAL,
+    availableDiskSpace: DISK_AVAILABLE,
+  },
+};
+
+export const fakeFiles = {
+  /** Puts files or directories on the fake disk. */
+  add: (...paths: string[]) => {
+    for (const path of paths) existing.add(withoutTrailingSlash(path));
+  },
+  /** Everything still on the fake disk. */
+  remaining: () => [...existing],
+  /** Every path deleted so far, in order. */
+  deleted: () => [...deleted],
+  /** Every download so far, in order. */
+  downloads: () => [...downloaded],
+  /** Makes deleting `path` throw, as a locked or protected file would. */
+  lock: (path: string) => void undeletable.add(withoutTrailingSlash(path)),
+  /** Empties the fake disk. Call it from `beforeEach` so tests stay isolated. */
+  clear: () => {
+    existing.clear();
+    deleted.length = 0;
+    downloaded.length = 0;
+    undeletable.clear();
+  },
+};

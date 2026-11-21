@@ -1,0 +1,139 @@
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models";
+import {
+  QueryCache,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react-native";
+import { createStore, Provider as JotaiProvider } from "jotai";
+import { apiAtom } from "@/providers/JellyfinProvider";
+import { makeApi } from "@/test-utils/jellyfinApi";
+import { LibraryItemCard } from "./LibraryItemCard";
+
+jest.mock("@/providers/JellyfinProvider", () =>
+  jest
+    .requireActual("@/test-utils/jellyfinProvider")
+    .makeJellyfinAtomsModule(null, { Id: "user-1" }),
+);
+jest.mock("@/utils/atoms/settings", () =>
+  jest.requireActual("@/test-utils/settings").makeSettingsModule({
+    libraryOptions: { display: "row", showStats: true },
+  }),
+);
+// The row layout these specs render draws no image.
+const mockPush = jest.fn();
+jest.mock("@/hooks/useAppRouter", () => () => ({ push: mockPush }));
+jest.mock("../common/TouchableItemRouter", () => {
+  const { Pressable } = jest.requireActual("react-native");
+  return { TouchableItemRouter: Pressable };
+});
+
+const LIBRARY: BaseItemDto = {
+  Id: "library-1",
+  Name: "Movies",
+  CollectionType: "movies",
+  ImageTags: { Primary: "tag" },
+};
+
+const renderCard = async (library: BaseItemDto = LIBRARY) => {
+  /** What the app's own query cache would have handed to Sentry. */
+  const errors: Error[] = [];
+  // No garbage collection timer nor retry: either keeps Jest from exiting.
+  const client = new QueryClient({
+    queryCache: new QueryCache({ onError: (error) => errors.push(error) }),
+    defaultOptions: {
+      queries: { gcTime: Number.POSITIVE_INFINITY, retry: false },
+    },
+  });
+  const store = createStore();
+  await render(
+    <QueryClientProvider client={client}>
+      <JotaiProvider store={store}>
+        <LibraryItemCard library={library} />
+      </JotaiProvider>
+    </QueryClientProvider>,
+  );
+  // Lets a query that started on mount settle.
+  await act(async () => {});
+  return { store, errors };
+};
+
+describe("LibraryItemCard", () => {
+  test("opens a library directly in its folders", async () => {
+    const { store } = await renderCard();
+    await act(async () => store.set(apiAtom, makeApi({ Items: [] })));
+    await fireEvent.press(await screen.findByText("Movies"));
+
+    expect(mockPush).toHaveBeenLastCalledWith({
+      pathname: "/(auth)/(tabs)/(libraries)/folders/[folderId]",
+      params: { folderId: "library-1", title: "Movies", catalog: "library" },
+    });
+  });
+
+  // Sentry REACT-NATIVE-D7: the card mounted before the api was restored and
+  // its count query handed the null api to the SDK, which threw "Cannot read
+  // property 'configuration' of null".
+  test("does not ask for the item count before the api is there", async () => {
+    const { errors } = await renderCard();
+
+    expect(errors).toEqual([]);
+  });
+
+  // The query key does not carry the api, so a count that failed on a null
+  // api never came back on its own.
+  test("asks for the item count once the api arrives", async () => {
+    const api = makeApi();
+    // The SDK writes the query into the url.
+    api.mock.onGet(/\/Items\?/).reply(200, { Items: [], TotalRecordCount: 12 });
+    const { store, errors } = await renderCard();
+
+    await act(async () => store.set(apiAtom, api));
+
+    await waitFor(() =>
+      expect(screen.getByText("12 library.item_types.movies")).toBeTruthy(),
+    );
+    expect(api.mock.history.get).toHaveLength(1);
+    const query = new URL(api.mock.history.get[0].url ?? "").searchParams;
+    expect(Object.fromEntries(query)).toEqual({
+      userId: "user-1",
+      parentId: "library-1",
+      recursive: "true",
+      limit: "0",
+      includeItemTypes: "Movie",
+    });
+    expect(errors).toEqual([]);
+  });
+
+  test("counts the channels of the Live TV view", async () => {
+    const api = makeApi();
+    api.mock
+      .onGet(/\/LiveTv\/Channels\?/)
+      .reply(200, { Items: [], TotalRecordCount: 42 });
+    const { store, errors } = await renderCard({
+      Id: "livetv-1",
+      Name: "Live TV",
+      CollectionType: "livetv",
+      ImageTags: { Primary: "tag" },
+    });
+
+    await act(async () => store.set(apiAtom, api));
+
+    await waitFor(() =>
+      expect(screen.getByText("42 live_tv.tabs.channels")).toBeTruthy(),
+    );
+    expect(api.mock.history.get).toHaveLength(1);
+    const query = new URL(api.mock.history.get[0].url ?? "").searchParams;
+    expect(Object.fromEntries(query)).toEqual({
+      userId: "user-1",
+      limit: "1",
+      addCurrentProgram: "false",
+    });
+    expect(errors).toEqual([]);
+  });
+});
